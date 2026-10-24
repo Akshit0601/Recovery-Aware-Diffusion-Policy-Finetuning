@@ -1,0 +1,15 @@
+torch
+torchvision
+mujoco==3.3.2
+robosuite==1.5.2
+gymnasium
+dm-control==1.0.23
+hydra-core
+wandb
+robomimic
+gdown
+dill
+einops
+diffusers
+zarr
+pandas
