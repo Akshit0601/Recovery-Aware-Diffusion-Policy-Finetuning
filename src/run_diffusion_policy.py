@@ -2,24 +2,18 @@
 """
 Run and evaluate the trained Diffusion Policy on Robomimic / Robosuite Lift environment.
 
-Default checkpoint:
-    /home/akshit/ece285_proj/robomimic/diffusion_policy_trained_models/test/20261024164824/models/model_epoch_150_low_dim_v15_success_1.0.pth
+All evaluation, environment, camera, and model checkpoint parameters are loaded
+from a YAML configuration file (default: config/run_diffusion_policy.yaml).
 
 Example usage:
-    # 1. Quick evaluation (10 rollouts)
-    python run_diffusion_policy.py --n_rollouts 10
+    # 1. Run using default config (config/run_diffusion_policy.yaml)
+    python src/run_diffusion_policy.py
 
-    # 2. Record video with wider FOV and camera pushed farther away
-    python run_diffusion_policy.py --n_rollouts 5 --video_path rollout_wide.mp4 --camera_dist_scale 1.8 --camera_fovy 70
+    # 2. Run with a specific config file
+    python src/run_diffusion_policy.py --config config/run_diffusion_policy.yaml
 
-    # 3. Use an alternative built-in wide camera (e.g. frontview or birdview)
-    python run_diffusion_policy.py --n_rollouts 5 --video_path rollout_front.mp4 --camera_names frontview
-
-    # 4. On-screen visualization (requires display/GUI)
-    python run_diffusion_policy.py --n_rollouts 3 --render --camera_dist_scale 1.5
-
-    # 5. Save rollouts to an HDF5 dataset
-    python run_diffusion_policy.py --n_rollouts 10 --dataset_path evaluated_rollouts.hdf5
+    # 3. Positional config argument
+    python src/run_diffusion_policy.py config/custom_eval.yaml
 """
 
 import argparse
@@ -32,6 +26,7 @@ import h5py
 import imageio
 import numpy as np
 import torch
+import yaml
 from tqdm import tqdm
 
 import robomimic
@@ -43,7 +38,25 @@ from robomimic.algo import RolloutPolicy
 from robomimic.envs.env_base import EnvBase
 from robomimic.envs.wrappers import EnvWrapper
 
-DEFAULT_CKPT = "/home/akshit/ece285_proj/robomimic/diffusion_policy_trained_models/test/20261024164824/models/model_epoch_150_low_dim_v15_success_1.0.pth"
+DEFAULT_CONFIG_PATH = "config/run_diffusion_policy.yaml"
+
+
+def load_config(config_path):
+    """Load and validate the YAML configuration file."""
+    if not os.path.exists(config_path):
+        # Fallback to repo root (one level up from src/)
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        fallback = os.path.join(repo_root, config_path)
+        if os.path.exists(fallback):
+            config_path = fallback
+        else:
+            print(f"Error: configuration file not found at '{config_path}'")
+            sys.exit(1)
+    with open(config_path, "r") as f:
+        cfg = yaml.safe_load(f)
+    if not isinstance(cfg, dict):
+        raise ValueError(f"Invalid YAML config format in '{config_path}'. Expected a dictionary.")
+    return cfg
 
 
 def rollout(
@@ -83,7 +96,6 @@ def rollout(
         for step_i in range(horizon):
             # Query action from the diffusion policy
             act = policy(ob=obs)
-            # print(f"the rolled out action is {act}")
 
             # Step the environment
             next_obs, r, done, _ = env.step(act)
@@ -148,141 +160,190 @@ def rollout(
     return stats, traj
 
 
-def run_diffusion_eval(args):
-    ckpt_path = args.agent
+def run_diffusion_eval(cfg):
+    """
+    Run diffusion policy evaluation driven entirely by config dictionary.
+    """
+    weights_cfg = cfg.get("weights", {})
+    rollout_cfg = cfg.get("rollout", {})
+    env_cfg = cfg.get("env", {})
+    render_cfg = cfg.get("rendering", {})
+    camera_cfg = cfg.get("camera", {})
+    obj_cfg = cfg.get("object_placement", {})
+    dataset_cfg = cfg.get("dataset", {})
+    system_cfg = cfg.get("system", {})
+
+    # Weights / Checkpoint
+    ckpt_path = weights_cfg.get("checkpoint_path") or cfg.get("agent")
+    if not ckpt_path:
+        raise ValueError("Missing 'checkpoint_path' under 'weights' in configuration.")
     if not os.path.exists(ckpt_path):
         print(f"Error: checkpoint file not found at {ckpt_path}")
         sys.exit(1)
 
-    write_video = args.video_path is not None
-    if args.render and write_video:
+    # Rollout parameters
+    n_rollouts = rollout_cfg.get("n_rollouts", 20)
+    horizon_override = rollout_cfg.get("horizon", None)
+    seed = rollout_cfg.get("seed", 0)
+
+    # Environment
+    env_name = env_cfg.get("env_name", None)
+
+    # Rendering & Video
+    render = render_cfg.get("render", False)
+    video_path = render_cfg.get("video_path", None)
+    video_skip = render_cfg.get("video_skip", 5)
+
+    write_video = video_path is not None
+    if render and write_video:
         raise ValueError("Cannot render on-screen and record video at the same time.")
+
+    # Camera
+    camera_names = camera_cfg.get("camera_names", ["agentview"])
+    if isinstance(camera_names, str):
+        camera_names = [camera_names]
+    camera_dist_scale = camera_cfg.get("camera_dist_scale", None)
+    camera_fovy = camera_cfg.get("camera_fovy", None)
+    camera_pos = camera_cfg.get("camera_pos", None)
+
+    # Object placement
+    object_pos = obj_cfg.get("object_pos", None)
+    object_x_range = obj_cfg.get("object_x_range", None)
+    object_y_range = obj_cfg.get("object_y_range", None)
+    object_ref_pos = obj_cfg.get("object_ref_pos", None)
+
+    # Dataset
+    dataset_path = dataset_cfg.get("dataset_path", None)
+    dataset_obs = dataset_cfg.get("dataset_obs", False)
+
+    # System
+    cpu = system_cfg.get("cpu", False)
+    verbose = system_cfg.get("verbose", False)
 
     print(f"\n{'='*70}")
     print(f"Loading Diffusion Policy Checkpoint:")
     print(f"  {ckpt_path}")
     print(f"{'='*70}")
 
-    device = TorchUtils.get_torch_device(try_to_use_cuda=(not args.cpu))
+    device = TorchUtils.get_torch_device(try_to_use_cuda=(not cpu))
 
     # Restore policy
     policy, ckpt_dict = FileUtils.policy_from_checkpoint(
-        ckpt_path=ckpt_path, device=device, verbose=args.verbose
+        ckpt_path=ckpt_path, device=device, verbose=verbose
     )
 
     # Determine rollout horizon
-    rollout_horizon = args.horizon
+    rollout_horizon = horizon_override
     if rollout_horizon is None:
         config, _ = FileUtils.config_from_checkpoint(ckpt_dict=ckpt_dict)
         rollout_horizon = config.experiment.rollout.horizon
-
-        print(f"Rollout horizon (from config): {rollout_horizon}")
+        print(f"Rollout horizon (from checkpoint config): {rollout_horizon}")
     else:
         print(f"Rollout horizon (override): {rollout_horizon}")
 
     # Build environment from saved checkpoint
     env, _ = FileUtils.env_from_checkpoint(
         ckpt_dict=ckpt_dict,
-        env_name=args.env,
-        render=args.render,
+        env_name=env_name,
+        render=render,
         render_offscreen=write_video,
-        verbose=args.verbose,
+        verbose=verbose,
     )
 
-    # Configure object placement sampler (Option 2)
+    # Configure object placement sampler
     robosuite_env = env.env.env if hasattr(env, "env") and hasattr(env.env, "env") else None
     if robosuite_env is not None and hasattr(robosuite_env, "placement_initializer"):
         sampler = robosuite_env.placement_initializer
 
         # If a fixed 2D position (x, y) was requested
-        if args.object_pos is not None:
-            sampler.x_range = [args.object_pos[0], args.object_pos[0]]
-            sampler.y_range = [args.object_pos[1], args.object_pos[1]]
-            print(f"Set fixed object position: X={args.object_pos[0]}, Y={args.object_pos[1]}")
+        if object_pos is not None:
+            sampler.x_range = [object_pos[0], object_pos[0]]
+            sampler.y_range = [object_pos[1], object_pos[1]]
+            print(f"Set fixed object position: X={object_pos[0]}, Y={object_pos[1]}")
         else:
-            if args.object_x_range is not None:
-                sampler.x_range = list(args.object_x_range)
+            if object_x_range is not None:
+                sampler.x_range = list(object_x_range)
                 print(f"Set object X sampling range: {sampler.x_range}")
-            if args.object_y_range is not None:
-                sampler.y_range = list(args.object_y_range)
+            if object_y_range is not None:
+                sampler.y_range = list(object_y_range)
                 print(f"Set object Y sampling range: {sampler.y_range}")
 
-        if args.object_ref_pos is not None:
-            sampler.reference_pos = np.array(args.object_ref_pos, dtype=float)
+        if object_ref_pos is not None:
+            sampler.reference_pos = np.array(object_ref_pos, dtype=float)
             print(f"Set object reference position: {sampler.reference_pos}")
     else:
-        if args.object_pos or args.object_x_range or args.object_y_range:
+        if object_pos or object_x_range or object_y_range:
             print("Warning: placement_initializer not found on environment. Skipping object range modification.")
 
-    # Configure camera position and FOV (push camera farther away / wider view)
+    # Configure camera position and FOV
     if robosuite_env is not None and hasattr(robosuite_env, "sim"):
         sim = robosuite_env.sim
-        for cam_name in args.camera_names:
+        for cam_name in camera_names:
             try:
                 cam_id = sim.model.camera_name2id(cam_name)
             except Exception:
                 continue
 
             # Modify Field of View (fovy)
-            if args.camera_fovy is not None:
-                sim.model.cam_fovy[cam_id] = float(args.camera_fovy)
-                print(f"Adjusted camera '{cam_name}' FOV (fovy) to: {args.camera_fovy}° (default is 45°)")
+            if camera_fovy is not None:
+                sim.model.cam_fovy[cam_id] = float(camera_fovy)
+                print(f"Adjusted camera '{cam_name}' FOV (fovy) to: {camera_fovy}° (default is 45°)")
 
             # Move camera farther away
-            if args.camera_pos is not None:
-                sim.model.cam_pos[cam_id] = np.array(args.camera_pos, dtype=float)
+            if camera_pos is not None:
+                sim.model.cam_pos[cam_id] = np.array(camera_pos, dtype=float)
                 print(f"Adjusted camera '{cam_name}' position to: {sim.model.cam_pos[cam_id]}")
-            elif args.camera_dist_scale is not None and args.camera_dist_scale != 1.0:
+            elif camera_dist_scale is not None and camera_dist_scale != 1.0:
                 # Table center reference point
                 target = np.array([0.0, 0.0, 0.8])
                 current_pos = np.array(sim.model.cam_pos[cam_id], dtype=float)
-                new_pos = target + (current_pos - target) * float(args.camera_dist_scale)
+                new_pos = target + (current_pos - target) * float(camera_dist_scale)
                 sim.model.cam_pos[cam_id] = new_pos
                 print(
-                    f"Pushed camera '{cam_name}' {args.camera_dist_scale}x farther away: "
+                    f"Pushed camera '{cam_name}' {camera_dist_scale}x farther away: "
                     f"pos {current_pos.round(3)} -> {new_pos.round(3)}"
                 )
 
     # Set seed if provided
-    if args.seed is not None:
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
-        print(f"Random seed set to: {args.seed}")
+    if seed is not None:
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        print(f"Random seed set to: {seed}")
 
     # Video setup
     video_writer = None
     if write_video:
-        video_dir = os.path.dirname(args.video_path)
+        video_dir = os.path.dirname(video_path)
         if video_dir:
             os.makedirs(video_dir, exist_ok=True)
-        video_writer = imageio.get_writer(args.video_path, fps=20)
-        print(f"Recording video to: {args.video_path}")
+        video_writer = imageio.get_writer(video_path, fps=20)
+        print(f"Recording video to: {video_path}")
 
     # HDF5 dataset setup
-    write_dataset = args.dataset_path is not None
+    write_dataset = dataset_path is not None
     if write_dataset:
-        data_dir = os.path.dirname(args.dataset_path)
+        data_dir = os.path.dirname(dataset_path)
         if data_dir:
             os.makedirs(data_dir, exist_ok=True)
-        data_writer = h5py.File(args.dataset_path, "w")
+        data_writer = h5py.File(dataset_path, "w")
         data_grp = data_writer.create_group("data")
         total_samples = 0
-        print(f"Saving rollout trajectories to: {args.dataset_path}")
+        print(f"Saving rollout trajectories to: {dataset_path}")
 
-    print(f"\nStarting {args.n_rollouts} rollouts...\n")
+    print(f"\nStarting {n_rollouts} rollouts...\n")
 
     rollout_stats = []
-    pbar = tqdm(range(args.n_rollouts), desc="Evaluating Diffusion Policy")
+    pbar = tqdm(range(n_rollouts), desc="Evaluating Diffusion Policy")
     for i in pbar:
         stats, traj = rollout(
             policy=policy,
             env=env,
             horizon=rollout_horizon,
-            render=args.render,
+            render=render,
             video_writer=video_writer,
-            video_skip=args.video_skip,
-            return_obs=(write_dataset and args.dataset_obs),
-            camera_names=args.camera_names,
+            video_skip=video_skip,
+            return_obs=(write_dataset and dataset_obs),
+            camera_names=camera_names,
         )
         rollout_stats.append(stats)
 
@@ -300,7 +361,7 @@ def run_diffusion_eval(args):
             ep_data_grp.create_dataset("states", data=np.array(traj["states"]))
             ep_data_grp.create_dataset("rewards", data=np.array(traj["rewards"]))
             ep_data_grp.create_dataset("dones", data=np.array(traj["dones"]))
-            if args.dataset_obs:
+            if dataset_obs:
                 for k in traj["obs"]:
                     ep_data_grp.create_dataset(f"obs/{k}", data=np.array(traj["obs"][k]))
                     ep_data_grp.create_dataset(f"next_obs/{k}", data=np.array(traj["next_obs"][k]))
@@ -312,13 +373,13 @@ def run_diffusion_eval(args):
 
     if video_writer is not None:
         video_writer.close()
-        print(f"\nVideo saved to: {args.video_path}")
+        print(f"\nVideo saved to: {video_path}")
 
     if write_dataset:
         data_grp.attrs["total"] = total_samples
         data_grp.attrs["env_args"] = json.dumps(env.serialize(), indent=4)
         data_writer.close()
-        print(f"\nDataset saved to: {args.dataset_path}")
+        print(f"\nDataset saved to: {dataset_path}")
 
     # Summary statistics
     stats_dict = TensorUtils.list_of_flat_dict_to_dict_of_list(rollout_stats)
@@ -341,136 +402,23 @@ def run_diffusion_eval(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Evaluate trained Diffusion Policy checkpoint on Robosuite environment."
+        description="Evaluate trained Diffusion Policy using a YAML configuration file."
     )
     parser.add_argument(
-        "--agent",
+        "--config",
         type=str,
-        default=DEFAULT_CKPT,
-        help="Path to trained checkpoint .pth file (defaults to your epoch 150 diffusion policy)",
+        default=DEFAULT_CONFIG_PATH,
+        help=f"Path to YAML configuration file (default: {DEFAULT_CONFIG_PATH})",
     )
     parser.add_argument(
-        "--n_rollouts",
-        type=int,
-        default=20,
-        help="Number of rollouts to evaluate (default: 20)",
-    )
-    parser.add_argument(
-        "--horizon",
-        type=int,
+        "config_pos",
+        nargs="?",
         default=None,
-        help="Override rollout horizon (default: read from model config, e.g. 400)",
-    )
-    parser.add_argument(
-        "--env",
-        type=str,
-        default=None,
-        help="Override environment name if different from checkpoint",
-    )
-    parser.add_argument(
-        "--render",
-        action="store_true",
-        help="Render rollouts on-screen (requires display)",
-    )
-    parser.add_argument(
-        "--video_path",
-        type=str,
-        default=None,
-        help="Path to save video of rollouts (.mp4)",
-    )
-    parser.add_argument(
-        "--video_skip",
-        type=int,
-        default=5,
-        help="Render video every N steps (default: 5)",
-    )
-    parser.add_argument(
-        "--camera_names",
-        type=str,
-        nargs="+",
-        default=["agentview"],
-        help="Camera name(s) for rendering (choices: agentview, frontview, birdview, sideview; default: agentview)",
-    )
-    parser.add_argument(
-        "--camera_dist_scale",
-        type=float,
-        default=None,
-        help="Multiplier to push the camera farther away from the table center (e.g. 1.5, 2.0; default: 1.0)",
-    )
-    parser.add_argument(
-        "--camera_fovy",
-        type=float,
-        default=None,
-        help="Field of view angle in degrees to widen camera view (e.g. 70 or 80; default: 45)",
-    )
-    parser.add_argument(
-        "--camera_pos",
-        type=float,
-        nargs=3,
-        default=None,
-        metavar=("X", "Y", "Z"),
-        help="Explicit camera position [X, Y, Z] in 3D world space",
-    )
-    parser.add_argument(
-        "--dataset_path",
-        type=str,
-        default=None,
-        help="Path to save rollout trajectories as an HDF5 dataset (.hdf5)",
-    )
-    parser.add_argument(
-        "--dataset_obs",
-        action="store_true",
-        help="Include observations in the saved HDF5 dataset",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=0,
-        help="Random seed for evaluation (default: 0)",
-    )
-    # Object placement modification options (Option 2)
-    parser.add_argument(
-        "--object_pos",
-        type=float,
-        nargs=2,
-        default=None,
-        metavar=("X", "Y"),
-        help="Fix object spawn position to specific table coordinates (e.g. --object_pos 0.05 -0.02)",
-    )
-    parser.add_argument(
-        "--object_x_range",
-        type=float,
-        nargs=2,
-        default=None,
-        metavar=("MIN", "MAX"),
-        help="Set custom X sampling range for object placement (default: -0.03 0.03)",
-    )
-    parser.add_argument(
-        "--object_y_range",
-        type=float,
-        nargs=2,
-        default=None,
-        metavar=("MIN", "MAX"),
-        help="Set custom Y sampling range for object placement (default: -0.03 0.03)",
-    )
-    parser.add_argument(
-        "--object_ref_pos",
-        type=float,
-        nargs=3,
-        default=None,
-        metavar=("X", "Y", "Z"),
-        help="Override table reference center position [X, Y, Z] (default: 0.0 0.0 0.8)",
-    )
-    parser.add_argument(
-        "--cpu",
-        action="store_true",
-        help="Force CPU execution instead of CUDA GPU",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Print verbose environment and policy loading details",
+        help="Optional positional path to YAML configuration file",
     )
 
     args = parser.parse_args()
-    run_diffusion_eval(args)
+    config_file = args.config_pos if args.config_pos is not None else args.config
+
+    config = load_config(config_file)
+    run_diffusion_eval(config)

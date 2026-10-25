@@ -3,9 +3,14 @@ diffusion_policy_repo/
 __pycache__/
 *.egg-info/
 *.pyc
-*.mp4
 *.hdf5
 .pytest_cache/
+
+# Media / images / videos
+*.mp4
+*.png
+*.jpg
+*.jpeg
 
 # Large binaries inside robomimic
 robomimic/diffusion_policy_trained_models/

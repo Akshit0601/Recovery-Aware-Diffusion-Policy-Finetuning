@@ -1,0 +1,57 @@
+# ==============================================================================
+# Diffusion Policy Evaluation Configuration
+# ==============================================================================
+
+# Model Checkpoint & Weights
+weights:
+  # Primary checkpoint path used for evaluation
+  checkpoint_path: "/home/akshit/ece285_proj/robomimic/diffusion_policy_trained_models/test/20261024164824/models/model_epoch_150_low_dim_v15_success_1.0.pth"
+
+  # Available checkpoint weights for quick reference and selection:
+  # - /home/akshit/ece285_proj/robomimic/diffusion_policy_trained_models/test/20261024164824/models/model_epoch_50_low_dim_v15_success_0.94.pth
+  # - /home/akshit/ece285_proj/robomimic/diffusion_policy_trained_models/test/20261024164824/models/model_epoch_100_low_dim_v15_success_0.98.pth
+  # - /home/akshit/ece285_proj/robomimic/diffusion_policy_trained_models/test/20261024164824/models/model_epoch_150_low_dim_v15_success_1.0.pth
+  # - /home/akshit/ece285_proj/robomimic/diffusion_policy_trained_models/test/20261024164824/models/model_epoch_200.pth
+  # - /home/akshit/ece285_proj/robomimic/diffusion_policy_trained_models/test/20261024164824/models/model_epoch_250.pth
+  # - /home/akshit/ece285_proj/robomimic/diffusion_policy_trained_models/test/20261024164824/last.pth
+
+# Rollout Evaluation Settings
+rollout:
+  n_rollouts: 10                  # Number of rollout episodes to evaluate
+  horizon: null                   # Step horizon override (null uses config from checkpoint, e.g. 400)
+  seed: 0                         # Random seed for torch and numpy
+
+# Environment Settings
+env:
+  env_name: null                  # Environment name override (null uses env from checkpoint, e.g. Lift)
+
+# Rendering & Video Recording
+rendering:
+  render: true                   # Render rollouts on-screen in real time (requires active display/GUI)
+  video_path: null                # Path to save evaluation video (.mp4), e.g. "rollout.mp4"; null to disable
+  video_skip: 5                   # Record video frame every N simulation steps
+
+# Camera Configuration
+camera:
+  camera_names:                   # List of cameras used for rendering / video
+    - "frontview"                 # Options: agentview, frontview, birdview, sideview
+  camera_dist_scale: null         # Multiplier to scale camera distance from table center (e.g. 1.5, 2.0; null leaves default)
+  camera_fovy: null               # Field of View in degrees to widen camera view (e.g. 70.0; null leaves default 45.0)
+  camera_pos: null                # Explicit camera 3D position [X, Y, Z]; null leaves default
+
+# Object Placement & Sampling Randomization
+object_placement:
+  object_pos: null                # Fixed object spawn coordinate [X, Y]; null uses sampling ranges
+  object_x_range: null            # Custom X sampling range [MIN, MAX], e.g. [-0.03, 0.03]; null keeps env default
+  object_y_range: null            # Custom Y sampling range [MIN, MAX], e.g. [-0.03, 0.03]; null keeps env default
+  object_ref_pos: null            # Table center reference coordinate [X, Y, Z], e.g. [0.0, 0.0, 0.8]; null keeps env default
+
+# Dataset Collection
+dataset:
+  dataset_path: null              # Path to export rollout trajectories as an HDF5 dataset (.hdf5); null to disable
+  dataset_obs: false              # Whether to record observations in the saved HDF5 dataset
+
+# System / Hardware Settings
+system:
+  cpu: false                      # Force CPU execution instead of CUDA GPU
+  verbose: false                  # Print verbose policy and environment loading details
