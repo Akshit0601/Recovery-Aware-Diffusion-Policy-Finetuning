@@ -1,0 +1,36 @@
+[project]
+name = "dp_env"
+version = "0.1.0"
+description = "Diffusion Policy evaluation and training on Robosuite Lift task"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "torch",
+    "torchvision",
+    "numpy>=1.23.0,<2.0.0",
+    "mujoco==3.3.2",
+    "robosuite==1.5.1",
+    "robosuite-models",
+    "robomimic",
+    "gymnasium",
+    "dm-control==1.0.23",
+    "zarr",
+    "einops",
+    "dill",
+    "pandas",
+    "hydra-core",
+    "wandb",
+    "imageio",
+    "imageio-ffmpeg",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+robomimic = { path = "robomimic", editable = true }
+robosuite = { git = "https://github.com/ARISE-Initiative/robosuite.git", tag = "v1.5.1" }
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"

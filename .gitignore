@@ -1,2 +1,13 @@
 .venv/
 diffusion_policy_repo/
+__pycache__/
+*.egg-info/
+*.pyc
+*.mp4
+*.hdf5
+.pytest_cache/
+
+# Large binaries inside robomimic
+robomimic/diffusion_policy_trained_models/
+robomimic/datasets/
+history/
