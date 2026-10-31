@@ -16,3 +16,4 @@ __pycache__/
 robomimic/diffusion_policy_trained_models/
 robomimic/datasets/
 history/
+*.ipynb

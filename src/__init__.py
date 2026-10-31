@@ -5,9 +5,11 @@ from src.diffusion_policy_runner import (
     BaseRunner,
     DiffusionPolicyRunner,
 )
+from src.eval_workspace_heatmap import WorkspaceHeatmapEvaluator
 
 __all__ = [
     "DiffusionPolicyRunner",
     "BaseRunner",
     "BaseDiffusionPolicyRunner",
+    "WorkspaceHeatmapEvaluator",
 ]

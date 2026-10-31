@@ -43,14 +43,14 @@ uv run python test/test_robosuite.py
 ### 2. Evaluate Trained Diffusion Policy
 Run evaluation rollouts using the default configuration (`config/run_diffusion_policy.yaml`):
 ```bash
-uv run python src/run_diffusion_policy.py
+uv run python -m src.run_diffusion_policy
 ```
 
 You can also pass an explicit configuration file via `--config` or as a positional argument:
 ```bash
-uv run python src/run_diffusion_policy.py --config config/run_diffusion_policy.yaml
+uv run python -m src.run_diffusion_policy --config config/run_diffusion_policy.yaml
 # or
-uv run python src/run_diffusion_policy.py config/run_diffusion_policy.yaml
+uv run python -m src.run_diffusion_policy config/run_diffusion_policy.yaml
 ```
 
 ### 3. Programmatic & Subclass Usage (`DiffusionPolicyRunner`)
@@ -73,6 +73,27 @@ class PerturbedPolicyRunner(DiffusionPolicyRunner):
         # Inject custom action noise or perturbation
         return action
 ```
+
+### 4. Workspace Grasp Failure Heatmap Evaluation (Config-Free)
+Evaluate policy grasping and task failure rates across a 2D spatial grid of object spawn poses and yaw orientations ($0^\circ, 30^\circ, 45^\circ$) directly via runner override methods.
+
+Edit the parameters directly at the top of [`src/eval_workspace_heatmap.py`](src/eval_workspace_heatmap.py):
+```python
+X_MIN = -0.15               # Minimum X coordinate in meters
+X_MAX = 0.15                # Maximum X coordinate in meters
+Y_MIN = -0.15               # Minimum Y coordinate in meters
+Y_MAX = 0.15                # Maximum Y coordinate in meters
+RESOLUTION = 5              # Grid resolution N along each axis (N x N spatial positions)
+YAW = [0.0, 30.0, 45.0]     # Yaw angle(s) in degrees
+OUTPUT_DIR = "results/heatmaps"  # Destination directory for output files
+```
+
+Then run directly:
+```bash
+uv run python -m src.eval_workspace_heatmap
+```
+
+
 
 
 ---
@@ -113,5 +134,5 @@ To switch checkpoints, update the `weights.checkpoint_path` field in `config/run
 If you prefer activating the virtual environment directly:
 ```bash
 source .venv/bin/activate
-python src/run_diffusion_policy.py
+python -m src.run_diffusion_policy
 ```
