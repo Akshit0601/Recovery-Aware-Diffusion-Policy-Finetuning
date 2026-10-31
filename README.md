@@ -53,6 +53,28 @@ uv run python src/run_diffusion_policy.py --config config/run_diffusion_policy.y
 uv run python src/run_diffusion_policy.py config/run_diffusion_policy.yaml
 ```
 
+### 3. Programmatic & Subclass Usage (`DiffusionPolicyRunner`)
+`src/diffusion_policy_runner.py` provides `DiffusionPolicyRunner` (also aliased as `BaseRunner`), which can be inherited or used directly across different experimental scripts:
+
+```python
+from src import DiffusionPolicyRunner
+
+# Run with programmatic configuration overrides
+runner = DiffusionPolicyRunner(
+    config_path="config/run_diffusion_policy.yaml",
+    overrides={"rollout": {"n_rollouts": 5}, "rendering": {"render": False}}
+)
+results = runner.run()
+
+# Or subclass to customize actions, observations, or perturbations
+class PerturbedPolicyRunner(DiffusionPolicyRunner):
+    def get_action(self, obs, step_i=0):
+        action = super().get_action(obs, step_i)
+        # Inject custom action noise or perturbation
+        return action
+```
+
+
 ---
 
 ## Configuration Reference (`config/run_diffusion_policy.yaml`)
