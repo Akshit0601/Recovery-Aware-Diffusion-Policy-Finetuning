@@ -3,8 +3,12 @@
 import pytest
 import numpy as np
 from src.diffusion_policy_runner import (
-    DiffusionPolicyRunner,
+    ALL_PHASES,
+    PHASE_APPROACHING,
+    PHASE_GRASPED,
+    PHASE_PRE_GRASP,
     BaseRunner,
+    DiffusionPolicyRunner,
     deep_update,
     rollout,
 )
@@ -128,3 +132,67 @@ def test_run_diffusion_eval_backwards_compatible():
     results = run_diffusion_eval(cfg)
     assert "summary" in results
     assert results["summary"]["total_rollouts"] == 1
+
+
+def test_phase_constants_and_detection():
+    """Verify phase constants and detection logic."""
+    assert PHASE_APPROACHING == "approaching"
+    assert PHASE_PRE_GRASP == "pre-grasp"
+    assert PHASE_GRASPED == "grasped"
+    assert ALL_PHASES == ["approaching", "pre-grasp", "grasped"]
+
+    runner = DiffusionPolicyRunner(
+        config_path="config/run_diffusion_policy.yaml",
+        overrides={"rollout": {"pre_grasp_arm_threshold": 0.4, "pre_grasp_gripper_threshold": 0.0}},
+    )
+
+    # 1. Approaching: arm moving, gripper open (-1.0)
+    approach_act = np.array([0.2, 0.1, -0.3, 0.0, 0.0, 0.0, -1.0])
+    phase = runner.detect_phase(action=approach_act, reward=0.0)
+    assert phase == PHASE_APPROACHING
+    assert runner.is_pre_grasp_action(approach_act) is False
+
+    # 2. Pre-grasp: pure gripper action (arm stationary, gripper closing)
+    pre_grasp_pure = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+    phase = runner.detect_phase(action=pre_grasp_pure, reward=0.0)
+    assert phase == PHASE_PRE_GRASP
+    assert runner.is_pre_grasp_action(pre_grasp_pure) is True
+
+    # 3. Pre-grasp: realistic small arm movement while gripper closing
+    pre_grasp_real = np.array([0.05, 0.02, -0.03, 0.01, 0.0, 0.01, 0.98])
+    phase = runner.detect_phase(action=pre_grasp_real, reward=0.0)
+    assert phase == PHASE_PRE_GRASP
+
+    # 4. Grasped: reward reaches 1.0
+    grasped_act = np.array([0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 1.0])
+    phase = runner.detect_phase(action=grasped_act, reward=1.0)
+    assert phase == PHASE_GRASPED
+
+
+def test_rollout_phase_tracking():
+    """Verify phases array, stats tracking, and on_phase_transition hook during rollout."""
+    transitions = []
+
+    class PhaseTrackingRunner(DiffusionPolicyRunner):
+        def on_phase_transition(self, prev_phase, new_phase, step_i, action, reward):
+            transitions.append((prev_phase, new_phase, step_i))
+
+    runner = PhaseTrackingRunner(
+        config_path="config/run_diffusion_policy.yaml",
+        overrides={
+            "rollout": {"n_rollouts": 1, "horizon": 3},
+            "rendering": {"render": False, "video_path": None},
+            "dataset": {"dataset_path": None},
+        },
+    )
+
+    results = runner.run()
+    stats = results["rollout_stats"][0]
+
+    assert "Final_Phase" in stats
+    assert stats["Final_Phase"] in ALL_PHASES
+    assert "Reached_PreGrasp" in stats
+    assert "Reached_Grasped" in stats
+    assert "pre_grasp_rate" in results["summary"]
+    assert "grasped_rate" in results["summary"]
+    assert "final_phase_counts" in results["summary"]

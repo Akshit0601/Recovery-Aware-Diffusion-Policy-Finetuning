@@ -225,7 +225,27 @@ class TrackingRunner(DiffusionPolicyRunner):
         self.step_rewards.append(reward)
 ```
 
-### 4. Custom Evaluation Metrics (`compute_summary` & `print_summary`)
+### 4. Phase Monitoring & Transition Interventions (`on_phase_transition`)
+`DiffusionPolicyRunner` tracks episode progress through three distinct execution phases:
+- `approaching` (`PHASE_APPROACHING`): The policy is running arm motion to approach the object (gripper open).
+- `pre-grasp` (`PHASE_PRE_GRASP`): The policy outputs only gripper actions (gripper closing command while arm translation/rotation deltas are stationary/minimal).
+- `grasped` (`PHASE_GRASPED`): The environment reward reaches 1.0 (object grasped and lifted).
+
+You can override `on_phase_transition` to react dynamically at phase boundaries (e.g. inject a slip perturbation right as the robot reaches pre-grasp):
+
+```python
+from src import DiffusionPolicyRunner, PHASE_PRE_GRASP, PHASE_GRASPED
+
+class SlipPerturbationRunner(DiffusionPolicyRunner):
+    def on_phase_transition(self, prev_phase, new_phase, step_i, action, reward):
+        super().on_phase_transition(prev_phase, new_phase, step_i, action, reward)
+        print(f"[Phase Shift] Step {step_i:2d}: {prev_phase} -> {new_phase}")
+
+        if new_phase == PHASE_PRE_GRASP:
+            print(f"Robot entered pre-grasp at step {step_i}!")
+```
+
+### 5. Custom Evaluation Metrics (`compute_summary` & `print_summary`)
 Augment evaluation output with domain-specific metrics (e.g., recovery time, trajectory jerk, gripper slip):
 
 ```python

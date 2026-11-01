@@ -24,13 +24,13 @@ from src.diffusion_policy_runner import DiffusionPolicyRunner
 # ==============================================================================
 # Evaluation Parameters (Edit directly here)
 # ==============================================================================
-X_MIN = -0.15               # Minimum X coordinate in meters
-X_MAX = 0.15                # Maximum X coordinate in meters
-Y_MIN = -0.15               # Minimum Y coordinate in meters
-Y_MAX = 0.15                # Maximum Y coordinate in meters
-RESOLUTION = 5             # Grid resolution N along each axis (N x N spatial positions)
-YAW: Union[float, List[float]] = [0.0, 30.0, 45.0]  # Yaw angle(s) in degrees: e.g. 0.0 or [0.0, 30.0, 45.0]
-OUTPUT_DIR = "results/heatmaps"  # Directory to save heatmaps and JSON statistics
+X_MIN = -0.03              # Minimum X coordinate in meters
+X_MAX = 0.03               # Maximum X coordinate in meters
+Y_MIN = -0.03               # Minimum Y coordinate in meters
+Y_MAX = 0.03                # Maximum Y coordinate in meters
+RESOLUTION = 25             # Grid resolution N along each axis (N x N spatial positions)
+YAW: Union[float, List[float]] = [0.0, 45.0]  # Yaw angle(s) in degrees: e.g. 0.0 or [0.0, 30.0, 45.0]
+OUTPUT_DIR = "results_full/heatmaps"  # Directory to save heatmaps and JSON statistics
 
 DEFAULT_CHECKPOINT_PATH = (
     "/home/akshit/ece285_proj/robomimic/diffusion_policy_trained_models/"

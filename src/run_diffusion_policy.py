@@ -19,9 +19,9 @@ from src.diffusion_policy_runner import (
 # ==============================================================================
 # Target Pose & Rendering Parameters (Edit directly here)
 # ==============================================================================
-X = 0.10           # Object X coordinate in meters (robot forward/backward)
-Y = 0.10           # Object Y coordinate in meters (robot left/right)
-YAW = 30            # Object Yaw angle in degrees (e.g. 0, 30, 45)
+X = 0.0025000000000000022           # Object X coordinate in meters (robot forward/backward)
+Y = 0.025           # Object Y coordinate in meters (robot left/right)
+YAW = 0.0            # Object Yaw angle in degrees (e.g. 0, 30, 45)
 RENDER = True        # Render on-screen in real time (True / False)
 
 

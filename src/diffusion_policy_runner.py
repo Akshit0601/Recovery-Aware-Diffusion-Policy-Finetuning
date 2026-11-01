@@ -17,7 +17,7 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
-
+import logging
 import h5py
 import imageio
 import numpy as np
@@ -36,6 +36,20 @@ from robomimic.envs.wrappers import EnvWrapper
 
 DEFAULT_CONFIG_PATH = "config/run_diffusion_policy.yaml"
 
+# Execution Phase Constants
+PHASE_APPROACHING: str = "approaching"
+PHASE_PRE_GRASP: str = "pre-grasp"
+PHASE_GRASPED: str = "grasped"
+ALL_PHASES: List[str] = [PHASE_APPROACHING, PHASE_PRE_GRASP, PHASE_GRASPED]
+
+# Configure logging so logging.info calls are visible when this class/module is imported
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(levelname)s] %(message)s",
+    force=True,
+)
+logging.getLogger("robosuite_logs").propagate = False
+logger = logging.getLogger(__name__)
 
 def deep_update(target: Dict[str, Any], source: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -138,6 +152,18 @@ class DiffusionPolicyRunner:
         self.data_writer: Optional[h5py.File] = None
         self.data_grp: Optional[h5py.Group] = None
         self.total_samples: int = 0
+
+        # Phase tracking configuration & state
+        self.pre_grasp_arm_threshold: float = float(
+            self.rollout_cfg.get("pre_grasp_arm_threshold", 0.4)
+        )
+        self.pre_grasp_gripper_threshold: float = float(
+            self.rollout_cfg.get("pre_grasp_gripper_threshold", 0.0)
+        )
+        self.sticky_phases: bool = bool(
+            self.rollout_cfg.get("sticky_phases", True)
+        )
+        self.current_phase: str = PHASE_APPROACHING
 
         # Setup flag: ready immediately if policy and env were provided
         self.is_setup: bool = (policy is not None and env is not None)
@@ -552,6 +578,88 @@ class DiffusionPolicyRunner:
         """Hook called immediately before starting a rollout episode."""
         pass
 
+    def is_pre_grasp_action(
+        self,
+        action: np.ndarray,
+        arm_threshold: Optional[float] = None,
+        gripper_threshold: Optional[float] = None,
+    ) -> bool:
+        """
+        Check if the action corresponds to the pre-grasp phase (policy outputs only gripper actions).
+
+        An action is considered pre-grasp when the arm movement delta is below the stationary
+        threshold and the gripper command is active (closing).
+        """
+        act = np.asarray(action).ravel()
+        if len(act) < 2:
+            return False
+        arm_thresh = arm_threshold if arm_threshold is not None else self.pre_grasp_arm_threshold
+        grip_thresh = gripper_threshold if gripper_threshold is not None else self.pre_grasp_gripper_threshold
+
+        arm_action = act[:-1]
+        gripper_action = act[-1]
+        arm_norm = float(np.linalg.norm(arm_action))
+
+        return bool(gripper_action > grip_thresh and arm_norm <= arm_thresh)
+
+    def detect_phase(
+        self,
+        action: np.ndarray,
+        reward: float = 0.0,
+        current_phase: Optional[str] = None,
+        obs: Optional[Dict[str, Any]] = None,
+        info: Optional[Dict[str, Any]] = None,
+        step_i: int = 0,
+    ) -> str:
+        """
+        Detect the operational execution phase for the current step.
+
+        Phases:
+          - 'approaching': Running policy towards the object (arm moving, gripper open).
+          - 'pre-grasp': Policy outputs only gripper actions (gripper closing, arm stationary).
+          - 'grasped': Reward is 1.0 (object successfully grasped and lifted).
+
+        Args:
+            action: Executed or outputted policy action array.
+            reward: Step reward returned by the environment.
+            current_phase: Phase of the previous step.
+            obs: Environment observation dictionary.
+            info: Environment info dictionary.
+            step_i: Step index in the rollout.
+
+        Returns:
+            One of PHASE_APPROACHING, PHASE_PRE_GRASP, or PHASE_GRASPED.
+        """
+        if reward >= 1.0:
+            return PHASE_GRASPED
+
+        if current_phase == PHASE_GRASPED:
+            return PHASE_GRASPED
+
+        if self.is_pre_grasp_action(action):
+            return PHASE_PRE_GRASP
+
+        if current_phase == PHASE_PRE_GRASP and self.sticky_phases:
+            return PHASE_PRE_GRASP
+
+        return PHASE_APPROACHING
+
+    def on_phase_transition(
+        self,
+        prev_phase: str,
+        new_phase: str,
+        step_i: int,
+        action: np.ndarray,
+        reward: float,
+    ) -> None:
+        """
+        Hook called when the rollout transitions from one execution phase to another.
+
+        Subclasses can override this to implement custom logging, perturbation injection,
+        or telemetry triggers.
+        """
+        pass
+
     def on_step_end(
         self,
         step_i: int,
@@ -654,9 +762,18 @@ class DiffusionPolicyRunner:
         total_reward = 0.0
         success = False
         step_i = 0
+        current_phase = PHASE_APPROACHING
+        self.current_phase = current_phase
+        pre_grasp_step: Optional[int] = None
+        grasped_step: Optional[int] = None
 
         traj: Dict[str, Any] = dict(
-            actions=[], rewards=[], dones=[], states=[], initial_state_dict=state_dict
+            actions=[],
+            rewards=[],
+            dones=[],
+            states=[],
+            phases=[],
+            initial_state_dict=state_dict,
         )
         if return_obs:
             traj.update(dict(obs=[], next_obs=[]))
@@ -680,6 +797,31 @@ class DiffusionPolicyRunner:
                     obs=next_obs, reward=r, done=done, info=info, env=active_env
                 )
 
+                # Phase detection & transition
+                new_phase = self.detect_phase(
+                    action=act,
+                    reward=float(r),
+                    current_phase=current_phase,
+                    obs=next_obs,
+                    info=info,
+                    step_i=step_i,
+                )
+                logging.info(f"the current phase for the arm is {new_phase}")
+                if new_phase != current_phase:
+                    self.on_phase_transition(
+                        prev_phase=current_phase,
+                        new_phase=new_phase,
+                        step_i=step_i,
+                        action=act,
+                        reward=float(r),
+                    )
+                    if new_phase == PHASE_PRE_GRASP and pre_grasp_step is None:
+                        pre_grasp_step = step_i
+                    elif new_phase == PHASE_GRASPED and grasped_step is None:
+                        grasped_step = step_i
+                    current_phase = new_phase
+                    self.current_phase = current_phase
+
                 # Handle rendering & video recording
                 video_count = self.on_step_render(
                     step_i=step_i,
@@ -696,6 +838,7 @@ class DiffusionPolicyRunner:
                 traj["rewards"].append(r)
                 traj["dones"].append(done)
                 traj["states"].append(state_dict.get("states", []))
+                traj["phases"].append(current_phase)
                 if return_obs:
                     traj["obs"].append(obs)
                     traj["next_obs"].append(next_obs)
@@ -725,6 +868,11 @@ class DiffusionPolicyRunner:
             Return=round(total_reward, 3),
             Horizon=(step_i + 1),
             Success_Rate=float(success),
+            Final_Phase=current_phase,
+            Reached_PreGrasp=bool(pre_grasp_step is not None),
+            Reached_Grasped=bool(grasped_step is not None),
+            PreGrasp_Step=pre_grasp_step,
+            Grasped_Step=grasped_step,
         )
 
         if return_obs:
@@ -788,6 +936,12 @@ class DiffusionPolicyRunner:
                 ep_data_grp.create_dataset(f"obs/{k}", data=np.array(traj["obs"][k]))
                 ep_data_grp.create_dataset(f"next_obs/{k}", data=np.array(traj["next_obs"][k]))
 
+        if "phases" in traj and self.data_grp is not None:
+            phase_strings = [str(p) for p in traj["phases"]]
+            ep_data_grp.create_dataset(
+                "phases", data=np.array(phase_strings, dtype=h5py.string_dtype())
+            )
+
         if "model" in traj["initial_state_dict"]:
             ep_data_grp.attrs["model_file"] = traj["initial_state_dict"]["model"]
 
@@ -808,6 +962,11 @@ class DiffusionPolicyRunner:
                 success_rate=0.0,
                 mean_return=0.0,
                 mean_horizon=0.0,
+                pre_grasp_rate=0.0,
+                grasped_rate=0.0,
+                mean_pre_grasp_step=None,
+                mean_grasped_step=None,
+                final_phase_counts={p: 0 for p in ALL_PHASES},
             )
 
         stats_dict = TensorUtils.list_of_flat_dict_to_dict_of_list(rollout_stats)
@@ -817,12 +976,28 @@ class DiffusionPolicyRunner:
         mean_return = float(np.mean(stats_dict["Return"]))
         mean_horizon = float(np.mean(stats_dict["Horizon"]))
 
+        pre_grasp_reached = sum(1 for s in rollout_stats if s.get("Reached_PreGrasp", False))
+        grasped_reached = sum(1 for s in rollout_stats if s.get("Reached_Grasped", False))
+        pre_grasp_steps = [
+            s["PreGrasp_Step"] for s in rollout_stats if s.get("PreGrasp_Step") is not None
+        ]
+        grasped_steps = [
+            s["Grasped_Step"] for s in rollout_stats if s.get("Grasped_Step") is not None
+        ]
+        final_phases = [s.get("Final_Phase", PHASE_APPROACHING) for s in rollout_stats]
+        phase_counts = {p: final_phases.count(p) for p in ALL_PHASES}
+
         return dict(
             total_rollouts=total,
             success_count=successes,
             success_rate=success_rate,
             mean_return=mean_return,
             mean_horizon=mean_horizon,
+            pre_grasp_rate=(pre_grasp_reached / total) * 100.0,
+            grasped_rate=(grasped_reached / total) * 100.0,
+            mean_pre_grasp_step=float(np.mean(pre_grasp_steps)) if pre_grasp_steps else None,
+            mean_grasped_step=float(np.mean(grasped_steps)) if grasped_steps else None,
+            final_phase_counts=phase_counts,
         )
 
     def print_summary(self, summary: Dict[str, Any]) -> None:
@@ -833,8 +1008,14 @@ class DiffusionPolicyRunner:
         print(f"Total Rollouts    : {summary['total_rollouts']}")
         print(f"Success Count     : {summary['success_count']} / {summary['total_rollouts']}")
         print(f"Success Rate      : {summary['success_rate']:.2f}%")
+        print(f"Pre-Grasp Rate    : {summary.get('pre_grasp_rate', 0.0):.2f}%")
+        print(f"Grasped Rate      : {summary.get('grasped_rate', 0.0):.2f}%")
         print(f"Mean Return       : {summary['mean_return']:.3f}")
         print(f"Mean Horizon (len): {summary['mean_horizon']:.2f} steps")
+        if summary.get("mean_pre_grasp_step") is not None:
+            print(f"Mean Pre-Grasp Stp: {summary['mean_pre_grasp_step']:.2f}")
+        if summary.get("mean_grasped_step") is not None:
+            print(f"Mean Grasped Step : {summary['mean_grasped_step']:.2f}")
         print(f"{'='*70}\n")
 
     def close(self) -> None:
@@ -983,6 +1164,10 @@ rollout = DiffusionPolicyRunner.rollout
 
 __all__ = [
     "DEFAULT_CONFIG_PATH",
+    "PHASE_APPROACHING",
+    "PHASE_PRE_GRASP",
+    "PHASE_GRASPED",
+    "ALL_PHASES",
     "DiffusionPolicyRunner",
     "BaseRunner",
     "BaseDiffusionPolicyRunner",
