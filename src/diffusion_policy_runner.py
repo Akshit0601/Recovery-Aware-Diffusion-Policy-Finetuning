@@ -791,7 +791,7 @@ class DiffusionPolicyRunner:
 
                 # Step environment
                 next_obs, r, done, info = self.step_env(act, env=active_env)
-
+                logging.info(f"the obs looks  like {next_obs}")
                 total_reward += float(r)
                 success = self.check_success(
                     obs=next_obs, reward=r, done=done, info=info, env=active_env

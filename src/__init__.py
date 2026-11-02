@@ -10,6 +10,7 @@ from src.diffusion_policy_runner import (
     DiffusionPolicyRunner,
 )
 from src.eval_workspace_heatmap import WorkspaceHeatmapEvaluator
+from src.eval_phase_disturbances import PhaseDisturbanceRunner
 
 __all__ = [
     "PHASE_APPROACHING",
@@ -20,4 +21,5 @@ __all__ = [
     "BaseRunner",
     "BaseDiffusionPolicyRunner",
     "WorkspaceHeatmapEvaluator",
+    "PhaseDisturbanceRunner",
 ]
