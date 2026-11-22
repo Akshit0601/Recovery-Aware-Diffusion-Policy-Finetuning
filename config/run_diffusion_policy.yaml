@@ -34,7 +34,7 @@ rendering:
 # Camera Configuration
 camera:
   camera_names:                   # List of cameras used for rendering / video
-    - "frontview"                 # Options: agentview, frontview, birdview, sideview
+    - "agentview"                 # Options: agentview, frontview, birdview, sideview
   camera_dist_scale: null         # Multiplier to scale camera distance from table center (e.g. 1.5, 2.0; null leaves default)
   camera_fovy: null               # Field of View in degrees to widen camera view (e.g. 70.0; null leaves default 45.0)
   camera_pos: null                # Explicit camera 3D position [X, Y, Z]; null leaves default

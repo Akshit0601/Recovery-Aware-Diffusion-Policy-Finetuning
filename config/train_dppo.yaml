@@ -1,0 +1,61 @@
+# ==============================================================================
+# Recovery-Aware DPPO Fine-Tuning Configuration (ECE285_MidTerm.pdf)
+# ==============================================================================
+
+experiment:
+  name: "dppo_recovery_finetuning"
+  seed: 42
+  device: "cuda"
+
+weights:
+  pretrained_checkpoint: "/home/akshit/ece285_proj/robomimic/diffusion_policy_trained_models/test/20261024164824/models/model_epoch_150_low_dim_v15_success_1.0.pth"
+  save_dir: "results/dppo_checkpoints"
+
+rollout:
+  n_episodes: 20             # N_ep rollouts per training iteration
+  horizon: 400               # Max episode simulation steps (≈ 50 decision chunks)
+  nominal_fraction: 0.4      # 40% nominal episodes
+  disturbed_fraction: 0.6    # 60% disturbed episodes
+  phase_ratio: [0.5, 0.5]    # papp : ppre (stratified between approach and pre-grasp)
+  k_ft_mode: "all"           # 'all' (all 100 denoising steps), 'strided', or 'tail'
+  k_ft_stride: 1             # Stride if k_ft_mode is 'strided'
+
+disturbances:
+  train:
+    approach:
+      x_range: [-0.04, 0.04]
+      y_range: [-0.04, 0.04]
+      yaw_range_deg: [-45.0, 45.0]
+      delay_steps: 20
+    pre_grasp:
+      x_range: [-0.03, 0.03]
+      y_range: [-0.02, 0.02]
+      yaw_range_deg: [-20.0, 20.0]
+      delay_steps: 5
+  held_out:
+    approach:
+      x_range: [-0.06, 0.06]
+      y_range: [-0.06, 0.06]
+      yaw_range_deg: [-90.0, 90.0]
+      delay_steps: 20
+    pre_grasp:
+      x_range: [-0.05, 0.05]
+      y_range: [-0.03, 0.03]
+      yaw_range_deg: [-35.0, 35.0]
+      delay_steps: 5
+
+rl:
+  gamma: 0.99                # Discount factor γ (γ < 1 explicitly penalizes delayed recovery)
+  gae_lambda: 0.95           # GAE smoothing parameter λ
+  clip_eps: 0.2              # PPO per-step clipping parameter ε
+  kl_weight_beta: 0.01       # Analytical KL penalty weight β (Equation 7)
+  critic_weight_cv: 0.5      # Value critic loss weight c_v (Equation 7)
+  epochs: 5                  # E optimization epochs per iteration
+  batch_size: 128            # Minibatch size |B| of (t, k) tuples
+  actor_lr: 1e-4             # η_0 initial actor learning rate
+  actor_lr_min: 1e-5         # η_min minimum decayed learning rate
+  critic_lr: 3e-4            # Critic learning rate
+  n1_decay_iters: 100        # N_1 decay iterations for conditioning pathway θ_cond
+  total_iterations: 100      # Total training iterations N
+  eval_interval: 10          # Benchmark held-out generalization every N iterations
+  eval_episodes: 20          # Rollouts per evaluation benchmark
