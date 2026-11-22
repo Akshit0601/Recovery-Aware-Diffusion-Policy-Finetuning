@@ -31,30 +31,31 @@ from src.diffusion_policy_runner import (
     PHASE_PRE_GRASP,
     DiffusionPolicyRunner,
 )
-
+import logging
+logger = logging.getLogger(__name__)
 # ==============================================================================
 # Phase Disturbance Configuration (Edit directly here - No Argparse)
 # ==============================================================================
 # Target phase(s) during which the object pose disturbance will be injected.
 # Options: "approaching", "pre-grasp", "grasped", or a list like ["approaching", "pre-grasp"]
-PERTURB_PHASE: Union[str, List[str]] = "pre-grasp"
+PERTURB_PHASE: Union[str, List[str]] = "approaching"
 
 # Pose Disturbance Displacements (applied to object in simulation):
-DELTA_X: float = 0.025          # Linear displacement along X in meters (+2.5 cm)
-DELTA_Y: float = 0.020          # Linear displacement along Y in meters (+2.0 cm)
+DELTA_X: float = 0.03          # Linear displacement along X in meters (+2.5 cm)
+DELTA_Y: float = 0.03          # Linear displacement along Y in meters (+2.0 cm)
 DELTA_Z: float = 0.000          # Linear displacement along Z in meters
 DELTA_YAW_DEG: float = 50.0     # Yaw rotation displacement in degrees (+15°)
 
 # Trigger timing within the phase:
 PERTURB_ONCE_PER_EPISODE: bool = True   # Apply disturbance only once per rollout episode
-PERTURB_STEP_DELAY: int = 0            # Number of steps after entering phase before perturbing (0 = immediately)
+PERTURB_STEP_DELAY: int = 20          # Number of steps after entering phase before perturbing (0 = immediately)
 
 # Random Disturbance Mode (Optional override):
 # If True, uniform random values within the ranges below are sampled instead of fixed DELTA_*
 USE_RANDOM_DISTURBANCE: bool = True
-RANDOM_X_RANGE: Tuple[float, float] = (-0.05, 0.05)
-RANDOM_Y_RANGE: Tuple[float, float] = (-0.03, 0.03)
-RANDOM_YAW_RANGE: Tuple[float, float] = (-30.0, 30.0)
+RANDOM_X_RANGE: Tuple[float, float] = (-0.06, 0.06)
+RANDOM_Y_RANGE: Tuple[float, float] = (-0.06, 0.06)
+RANDOM_YAW_RANGE: Tuple[float, float] = (-90.0, 90.0)
 
 # Initial object spawn placement (None uses default/randomized table sampler):
 OBJECT_INIT_X: Optional[float] = None
@@ -66,7 +67,7 @@ N_ROLLOUTS: int = 200                     # Number of evaluation rollout episode
 HORIZON: int = 400                      # Maximum steps per episode
 RENDER: bool = False                    # Set True for real-time graphical visualization
 VIDEO_PATH: Optional[str] = None        # e.g. "results/phase_disturbances/video.mp4" (or None)
-OUTPUT_DIR: str = "results/phase_disturbances"  # Directory to save metrics and disturbance records
+OUTPUT_DIR: str = "results/phase_disturbances_approaching"  # Directory to save metrics and disturbance records
 SEED: int = 42
 
 DEFAULT_CHECKPOINT_PATH = (
@@ -403,6 +404,8 @@ class PhaseDisturbanceRunner(DiffusionPolicyRunner):
 
         if self._should_disturb():
             dist_record = self.apply_object_disturbance()
+            logger.info("applying disturbances")
+            
             # Refresh observation with frame stacking so policy perceives updated pose
             next_obs = self._refresh_observation(active_env, action=action)
             logging.info(
