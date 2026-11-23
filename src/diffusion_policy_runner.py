@@ -304,8 +304,13 @@ class DiffusionPolicyRunner:
         print(f"  {ckpt_path}")
         print(f"{'='*70}")
 
+        # PyTorch >= 2.6 defaults torch.load to weights_only=True, which rejects the
+        # numpy objects robomimic pickles into checkpoints; load the dict ourselves.
+        ckpt_dict = torch.load(
+            os.path.expanduser(str(ckpt_path)), map_location="cpu", weights_only=False
+        )
         policy, ckpt_dict = FileUtils.policy_from_checkpoint(
-            ckpt_path=ckpt_path, device=self.device, verbose=verbose
+            ckpt_dict=ckpt_dict, device=self.device, verbose=verbose
         )
         self.policy = policy
         self.ckpt_dict = ckpt_dict

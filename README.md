@@ -28,6 +28,16 @@ Reproducible environment for evaluating and training Diffusion Policies on the R
    ```
    *`uv` automatically downloads standalone Python 3.10, creates the `.venv`, and installs all locked dependencies (PyTorch with CUDA 12.4, Robosuite 1.5.1, and Robomimic).*
 
+### Without `uv` (plain Python + pip, e.g. on a server)
+Needs Python 3.10. `requirements.txt` is exported from `uv.lock`, so it has the same pinned versions, the CUDA 12.4
+PyTorch index and the local editable `./robomimic`:
+```bash
+python3.10 -m venv .venv            # or: conda create -n dp_env python=3.10 && conda activate dp_env
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+Afterwards, every `uv run python ...` command in this README is just `python ...` with the environment activated.
+
 ---
 
 ## Configuration & Usage
@@ -109,11 +119,19 @@ rsync -av robomimic/diffusion_policy_trained_models/test/20261024164824/models/m
 ```
 Rendering is off and observations are low-dim, so no display / `MUJOCO_GL` setup is needed.
 
-**Launch training in the background** (survives SSH logout; stdout/stderr go to a timestamped file in `logs/`):
+All commands below are run from the repo root with the environment activated (`source .venv/bin/activate`).
+With uv instead, replace `python` by `uv run python`.
+
+**Train (foreground):**
+```bash
+PYTHONPATH=. python -m src.train_dppo --config config/train_dppo.yaml
+```
+
+**Train in the background** (survives SSH logout; stdout/stderr go to a timestamped file in `logs/`):
 ```bash
 mkdir -p logs
 RUN=dppo_$(date +%Y%m%d_%H%M%S)
-PYTHONPATH=. CUDA_VISIBLE_DEVICES=0 nohup uv run python -u -m src.train_dppo \
+PYTHONPATH=. CUDA_VISIBLE_DEVICES=0 nohup python -u -m src.train_dppo \
   --config config/train_dppo.yaml > logs/${RUN}.log 2>&1 &
 echo $! > logs/${RUN}.pid
 tail -f logs/${RUN}.log          # Ctrl-C stops tailing, not training
@@ -121,7 +139,7 @@ tail -f logs/${RUN}.log          # Ctrl-C stops tailing, not training
 - Checkpoints, `train.log` and per-iteration `metrics.jsonl` are written to `weights.save_dir` (default `results/dppo_checkpoints/`).
 - `dppo_last.pt` is overwritten every iteration (with optimizer + RNG state). After a crash, kill or reboot, resume with:
   ```bash
-  PYTHONPATH=. nohup uv run python -u -m src.train_dppo --config config/train_dppo.yaml \
+  PYTHONPATH=. nohup python -u -m src.train_dppo --config config/train_dppo.yaml \
     --resume results/dppo_checkpoints/dppo_last.pt > logs/${RUN}_resume.log 2>&1 &
   ```
 - Stop a run: `kill $(cat logs/${RUN}.pid)`.
@@ -131,12 +149,17 @@ tail -f logs/${RUN}.log          # Ctrl-C stops tailing, not training
 **Evaluate** (fixed `rl.eval_seed`, so both runs see identical scenarios):
 ```bash
 # pretrained baseline
-PYTHONPATH=. uv run python -m src.train_dppo --eval-only --eval-episodes 100
+PYTHONPATH=. python -m src.train_dppo --eval-only --eval-episodes 100
 # fine-tuned checkpoint
-PYTHONPATH=. uv run python -m src.train_dppo --eval-only --eval-episodes 100 \
+PYTHONPATH=. python -m src.train_dppo --eval-only --eval-episodes 100 \
   --checkpoint results/dppo_checkpoints/dppo_best_iter_40.pt
 ```
 Keep `rollout.num_envs` the same across runs you compare.
+
+**Tests:**
+```bash
+PYTHONPATH=. python -m pytest -p no:launch_testing test/test_dppo.py -v
+```
 
 **Resources** (measured on an RTX 4050 laptop): ~2 GB GPU for rollouts, ~3.2 GB for updates at `batch_size: 512`
 (fits an 8 GB card), ~3 GB RAM for 16 envs. Rollouts take ~3.6 s/episode with `num_envs: 16`; expect roughly

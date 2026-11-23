@@ -121,8 +121,13 @@ class DPPOTrainer:
 
     def _load_pretrained_model(self) -> None:
         """Load pretrained diffusion policy and create frozen reference anchor θ_0."""
+        # PyTorch >= 2.6 defaults torch.load to weights_only=True, which rejects the
+        # numpy objects robomimic pickles into checkpoints; load the dict ourselves.
+        ckpt_dict = torch.load(
+            os.path.expanduser(str(self.checkpoint_path)), map_location="cpu", weights_only=False
+        )
         self.policy, self.ckpt_dict = FileUtils.policy_from_checkpoint(
-            ckpt_path=self.checkpoint_path,
+            ckpt_dict=ckpt_dict,
             device=self.device,
             verbose=False,
         )
