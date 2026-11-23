@@ -30,7 +30,16 @@ class DDPMSampler:
         action_horizon: int = 8,
         observation_horizon: int = 2,
         action_dim: int = 7,
+        min_sampling_std: float = 0.0,
+        min_logprob_std: float = 0.0,
     ) -> None:
+        # σ floors (DPPO, Ren et al. 2024). The true DDPM σ_k is ~0.02 at k=1 and
+        # ~1e-10 at k=0, which makes the per-step Gaussian log-prob / KL over the
+        # Tp*Da action dims explode. min_sampling_std floors the noise actually
+        # injected during rollouts (exploration); min_logprob_std floors the σ
+        # recorded for the ratio/KL. Keep min_logprob_std >= min_sampling_std.
+        self.min_sampling_std = float(min_sampling_std)
+        self.min_logprob_std = float(min_logprob_std)
         self.noise_scheduler = noise_scheduler
         self.obs_encoder = obs_encoder
         self.noise_pred_net = noise_pred_net
@@ -146,6 +155,7 @@ class DDPMSampler:
         noise_pred_net: Optional[nn.Module] = None,
         obs_encoder: Optional[nn.Module] = None,
         k_ft_set: Optional[Set[int]] = None,
+        min_sampling_std: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[Dict[str, Any]]]:
         """
         Run the complete K-step DDPM reverse diffusion chain, recording (s_t, a^k, k, a^{k-1}, μ, σ).
@@ -154,7 +164,10 @@ class DDPMSampler:
             obs_dict: Observation dictionary from environment
             noise_pred_net: Policy network to use (defaults to self.noise_pred_net)
             obs_encoder: Encoder network to use (defaults to self.obs_encoder)
-            k_ft_set: Set of timestep integers that receive gradient K_ft (None = all timesteps)
+            k_ft_set: Set of timestep integers that receive gradient K_ft (None = all timesteps).
+                The final step t=0 is deterministic (no noise) and is never recorded.
+            min_sampling_std: Override self.min_sampling_std (e.g. 0.0 for evaluation with
+                the true DDPM chain).
 
         Returns:
             executed_actions: Action chunk to execute of shape (B, Ta, Da)
@@ -172,15 +185,21 @@ class DDPMSampler:
 
         recorded_transitions: List[Dict[str, Any]] = []
 
+        samp_floor = self.min_sampling_std if min_sampling_std is None else float(min_sampling_std)
+        logprob_floor = max(self.min_logprob_std, samp_floor)
+
         for t in self.timesteps:
             mu, sigma = self.compute_step_mean(active_net, naction, t, obs_cond)
 
-            # Draw a^{k-1} ~ N(μ, σ² I)
-            if t > 0:
-                noise = torch.randn_like(naction)
-                a_prev = mu + sigma * noise
-            else:
-                a_prev = mu
+            # Final step is deterministic: a^0 = μ. It has no valid Gaussian
+            # likelihood, so it is never part of the PPO/KL objective.
+            if t == 0:
+                naction = mu
+                continue
+
+            # Draw a^{k-1} ~ N(μ, σ_samp² I)
+            sigma_samp = sigma.clamp(min=samp_floor)
+            a_prev = mu + sigma_samp * torch.randn_like(naction)
 
             # If this step receives fine-tuning gradient
             if k_ft_set is None or t in k_ft_set:
@@ -189,7 +208,8 @@ class DDPMSampler:
                     "sample": naction.detach().clone(),
                     "prev_sample": a_prev.detach().clone(),
                     "mu": mu.detach().clone(),
-                    "sigma": sigma.detach().clone(),
+                    # σ used by the ratio and the KL anchor
+                    "sigma": sigma.clamp(min=logprob_floor).detach().clone(),
                 })
 
             naction = a_prev

@@ -98,6 +98,52 @@ uv run python -m src.eval_workspace_heatmap
 
 ---
 
+### 5. DPPO Recovery Fine-Tuning (server / headless)
+Details of the method are in [`fine_tune.md`](fine_tune.md); hyperparameters live in [`config/train_dppo.yaml`](config/train_dppo.yaml).
+
+**One-time setup on the server.** The pretrained checkpoint is gitignored, so copy it over to the same relative path
+(`weights.pretrained_checkpoint` is resolved relative to the repo root):
+```bash
+rsync -av robomimic/diffusion_policy_trained_models/test/20261024164824/models/model_epoch_150_low_dim_v15_success_1.0.pth \
+  <server>:<repo>/robomimic/diffusion_policy_trained_models/test/20261024164824/models/
+```
+Rendering is off and observations are low-dim, so no display / `MUJOCO_GL` setup is needed.
+
+**Launch training in the background** (survives SSH logout; stdout/stderr go to a timestamped file in `logs/`):
+```bash
+mkdir -p logs
+RUN=dppo_$(date +%Y%m%d_%H%M%S)
+PYTHONPATH=. CUDA_VISIBLE_DEVICES=0 nohup uv run python -u -m src.train_dppo \
+  --config config/train_dppo.yaml > logs/${RUN}.log 2>&1 &
+echo $! > logs/${RUN}.pid
+tail -f logs/${RUN}.log          # Ctrl-C stops tailing, not training
+```
+- Checkpoints, `train.log` and per-iteration `metrics.jsonl` are written to `weights.save_dir` (default `results/dppo_checkpoints/`).
+- `dppo_last.pt` is overwritten every iteration (with optimizer + RNG state). After a crash, kill or reboot, resume with:
+  ```bash
+  PYTHONPATH=. nohup uv run python -u -m src.train_dppo --config config/train_dppo.yaml \
+    --resume results/dppo_checkpoints/dppo_last.pt > logs/${RUN}_resume.log 2>&1 &
+  ```
+- Stop a run: `kill $(cat logs/${RUN}.pid)`.
+- Things to watch in the log: `ClipFrac` (healthy ≈ 0.1–0.5), `ApproxKL` / `Epochs` (early stopping), and the periodic
+  `Evaluation (iter N)` lines versus the `Baseline (pretrained, iter 0)` line.
+
+**Evaluate** (fixed `rl.eval_seed`, so both runs see identical scenarios):
+```bash
+# pretrained baseline
+PYTHONPATH=. uv run python -m src.train_dppo --eval-only --eval-episodes 100
+# fine-tuned checkpoint
+PYTHONPATH=. uv run python -m src.train_dppo --eval-only --eval-episodes 100 \
+  --checkpoint results/dppo_checkpoints/dppo_best_iter_40.pt
+```
+Keep `rollout.num_envs` the same across runs you compare.
+
+**Resources** (measured on an RTX 4050 laptop): ~2 GB GPU for rollouts, ~3.2 GB for updates at `batch_size: 512`
+(fits an 8 GB card), ~3 GB RAM for 16 envs. Rollouts take ~3.6 s/episode with `num_envs: 16`; expect roughly
+**8–10 h** for the default 100 iterations including evaluations (vs ~28 h with a single env).
+
+---
+
 ## Configuration Reference (`config/run_diffusion_policy.yaml`)
 
 Edit [`config/run_diffusion_policy.yaml`](config/run_diffusion_policy.yaml) to customize evaluation behavior without passing complex command-line arguments:

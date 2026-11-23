@@ -136,7 +136,7 @@ def test_rollout_buffer_gae():
 
 def test_dppo_trainer_integration_smoke():
     """Verify DPPOTrainer loads checkpoint, collects mini rollouts, and updates policy/critic."""
-    ckpt_path = "/home/akshit/ece285_proj/robomimic/diffusion_policy_trained_models/test/20261024164824/models/model_epoch_150_low_dim_v15_success_1.0.pth"
+    ckpt_path = Path(__file__).resolve().parent.parent / "robomimic/diffusion_policy_trained_models/test/20261024164824/models/model_epoch_150_low_dim_v15_success_1.0.pth"
     if not Path(ckpt_path).exists():
         pytest.skip(f"Checkpoint not found at {ckpt_path}")
 
@@ -166,7 +166,7 @@ def test_dppo_trainer_integration_smoke():
     }
 
     trainer = DPPOTrainer(
-        checkpoint_path=ckpt_path,
+        checkpoint_path=str(ckpt_path),
         config=mini_cfg,
         device="cpu",
     )

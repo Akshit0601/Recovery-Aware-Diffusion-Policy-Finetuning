@@ -8,17 +8,26 @@ experiment:
   device: "cuda"
 
 weights:
-  pretrained_checkpoint: "/home/akshit/ece285_proj/robomimic/diffusion_policy_trained_models/test/20261024164824/models/model_epoch_150_low_dim_v15_success_1.0.pth"
+  pretrained_checkpoint: "robomimic/diffusion_policy_trained_models/test/20261024164824/models/model_epoch_150_low_dim_v15_success_1.0.pth"
+  use_ema: true              # Fine-tune the EMA weights (what robomimic evaluated as success_1.0), not the raw nets
   save_dir: "results/dppo_checkpoints"
 
 rollout:
-  n_episodes: 20             # N_ep rollouts per training iteration
-  horizon: 400               # Max episode simulation steps (≈ 50 decision chunks)
+  n_episodes: 50             # N_ep rollouts per training iteration (20 nominal / 15 approach / 15 pre-grasp).
+                             #   ~7.5k (t,k) samples/iter with k_ft_tail_m=10. Rollout is the wall-clock bottleneck
+                             #   (~1 s per chunk, sequential 100-step denoising), not GPU memory.
+  num_envs: 16               # Parallel envs; the reverse chain is denoised for all of them in one batch.
+                             #   Measured: 251 ms/chunk at 16 envs vs ~980 ms at 1 env (3.9x). ~2 GB GPU, ~3 GB RAM.
+  horizon: 400               # Max env steps (= 50 chunks). Kept at 400: successes finish by ~110 steps even after
+                             #   re-grasp; a longer horizon only lengthens failed episodes.
   nominal_fraction: 0.4      # 40% nominal episodes
   disturbed_fraction: 0.6    # 60% disturbed episodes
   phase_ratio: [0.5, 0.5]    # papp : ppre (stratified between approach and pre-grasp)
-  k_ft_mode: "all"           # 'all' (all 100 denoising steps), 'strided', or 'tail'
+  k_ft_mode: "tail"          # 'all' (steps 1..99), 'strided', or 'tail' (steps 1..k_ft_tail_m). t=0 is never fine-tuned.
   k_ft_stride: 1             # Stride if k_ft_mode is 'strided'
+  k_ft_tail_m: 10            # Number of final denoising steps fine-tuned if k_ft_mode is 'tail' (DPPO default)
+  min_sampling_std: 0.1      # σ floor for noise injected during training rollouts (eval uses true DDPM σ)
+  min_logprob_std: 0.1       # σ floor used in the PPO ratio and KL anchor (must be >= min_sampling_std)
 
 disturbances:
   train:
@@ -31,7 +40,7 @@ disturbances:
       x_range: [-0.03, 0.03]
       y_range: [-0.02, 0.02]
       yaw_range_deg: [-20.0, 20.0]
-      delay_steps: 5
+      delay_steps: 0
   held_out:
     approach:
       x_range: [-0.06, 0.06]
@@ -45,17 +54,30 @@ disturbances:
       delay_steps: 5
 
 rl:
-  gamma: 0.99                # Discount factor γ (γ < 1 explicitly penalizes delayed recovery)
+  gamma: 0.99                # Discount per CHUNK (one GAE step = 8 env steps), i.e. ~0.9987 per env step
   gae_lambda: 0.95           # GAE smoothing parameter λ
-  clip_eps: 0.2              # PPO per-step clipping parameter ε
+  clip_eps: 0.1              # PPO per-denoising-step clip ε. Each ratio spans the full 16x7 chunk, so it is very
+                             #   sensitive. Measured on real rollouts (lr 3e-6): clip frac 0.07 → 0.54 over 10 epochs.
   kl_weight_beta: 0.01       # Analytical KL penalty weight β (Equation 7)
-  critic_weight_cv: 0.5      # Value critic loss weight c_v (Equation 7)
-  epochs: 5                  # E optimization epochs per iteration
-  batch_size: 128            # Minibatch size |B| of (t, k) tuples
-  actor_lr: 1e-4             # η_0 initial actor learning rate
-  actor_lr_min: 1e-5         # η_min minimum decayed learning rate
+  critic_weight_cv: 0.5      # Unused: actor and critic have separate optimizers
+  epochs: 10                 # Max optimization epochs per iteration (may stop early, see target_kl)
+  target_kl: 0.005           # Stop an iteration's epochs once mean approx KL(π_old‖π_θ) per denoising step exceeds this.
+                             #   null disables. With the values above this triggers around epoch 6.
+  batch_size: 512            # Minibatch of (t, k) tuples, sized for an 8 GB card. Measured peak allocated GPU memory:
+                             #   512 → 3.2 GB, 1024 → 4.0 GB (rollouts: 1.9 GB). 1024 also fits on 8 GB if nothing
+                             #   else (display, other jobs) is using the GPU.
+  actor_lr: 3e-6             # η_0. 1e-4 clipped 99% of samples after ONE Adam step; 1e-5 → ~0.7-0.9 clipped.
+  actor_lr_min: 1e-6         # η_min for θ_cond after N_1 iterations
   critic_lr: 3e-4            # Critic learning rate
   n1_decay_iters: 100        # N_1 decay iterations for conditioning pathway θ_cond
   total_iterations: 100      # Total training iterations N
-  eval_interval: 10          # Benchmark held-out generalization every N iterations
-  eval_episodes: 20          # Rollouts per evaluation benchmark
+
+  # Evaluation / model selection (issue #8)
+  eval_interval: 10                    # Evaluate every N iterations (plus the final iteration)
+  eval_episodes_per_regime: 30         # Episodes in EACH of 5 regimes (nominal, train app/pre, held-out app/pre) = 150
+  eval_seed: 1234                      # Fixed seed: every eval sees identical object inits + disturbances,
+                                       #   so checkpoints are compared on the same scenarios (paired comparison)
+  eval_at_start: true                  # Evaluate the pretrained policy first; "best" must beat it
+  final_eval_episodes_per_regime: 100  # Larger eval of the selected checkpoint at the end (report these numbers).
+                                       #   0 disables. Get matching baseline numbers with:
+                                       #   python -m src.train_dppo --eval-only --eval-episodes 100

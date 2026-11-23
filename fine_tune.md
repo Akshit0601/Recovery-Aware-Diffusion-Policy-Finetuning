@@ -53,6 +53,12 @@ Since $\pi_\theta$ and $\pi_{\theta_0}$ share $\sigma_k$, the per-step Gaussian 
 $$\text{KL}(\pi_\theta \parallel \pi_{\theta_0})|_{t,k} = \frac{\|\mu_\theta - \mu_{\theta_0}\|^2}{2\sigma_k^2} = \frac{(1 - \alpha_k)^2}{2\sigma_k^2 \alpha_k (1 - \bar{\alpha}_k)} \|\epsilon_\theta - \epsilon_{\theta_0}\|^2$$
 $$L_{\text{KL}}(\theta) = \frac{1}{|B|} \sum_{(t, k) \in B} \text{KL}|_{t,k}$$
 
+### 3.4.1 Denoising-Step Selection and σ Floor
+The true DDPM $\sigma_k$ is tiny near the end of the chain ($\sigma_1 \approx 0.02$, $\sigma_0 \approx 10^{-10}$), so the ratio in §3.2 and the KL in §3.4 explode for small $k$ (a $10^{-3}$ change in $\mu$ gave a KL of ~2800 at $k=0$). Following DPPO:
+- $k=0$ is deterministic ($a^0 = \mu_\theta$) and is never part of the objective.
+- Only the last $K_{\text{ft}} = 10$ steps ($k = 1..10$) are fine-tuned (`k_ft_mode: tail`); earlier steps are sampled but not trained. This also cuts the update cost ~10×.
+- Training rollouts sample with $\max(\sigma_k, 0.1)$, and the same floor is used in $\rho$ and $\text{KL}$ (`min_sampling_std`, `min_logprob_std`). Evaluation uses the true DDPM $\sigma_k$, so its numbers are comparable to the pretrained baseline.
+
 ### 3.5 Total Loss
 $$L(\theta, \phi) = L_{\text{actor}}(\theta) + c_v L_{\text{critic}}(\phi) + \beta L_{\text{KL}}(\theta)$$
 
@@ -60,11 +66,26 @@ $$L(\theta, \phi) = L_{\text{actor}}(\theta) + c_v L_{\text{critic}}(\phi) + \be
 
 ## 4. Parameter Partitioning Schedule
 
+$\theta_0$ is the **EMA** weight set of the epoch-150 checkpoint (`model_epoch_150_low_dim_v15_success_1.0.pth`, `weights.use_ema: true`). robomimic evaluates with the EMA weights, so that is the policy behind the 100% success; the raw training weights in the same file differ by ~7% (relative norm).
+
 The policy weights $\theta = (\theta_{\text{time}}, \theta_{\text{cond}}, \theta_{\text{rest}})$ are partitioned as follows:
 - **$\theta_{\text{time}}$ (`diffusion_step_encoder`)**: **FROZEN** throughout training so the meaning of noise levels remains invariant.
-- **$\theta_{\text{cond}}$ (`cond_encoder` in residual blocks)**: Trainable with learning rate decaying from $\eta_0 = 10^{-4}$ to $\eta_{\text{min}} = 10^{-5}$ across the initial $N_1 \in [100, 150]$ iterations.
+- **$\theta_{\text{cond}}$ (`cond_encoder` in residual blocks)**: Trainable with learning rate decaying from $\eta_0 = 3 \times 10^{-6}$ to $\eta_{\text{min}} = 10^{-6}$ across the initial $N_1 = 100$ iterations (see §4.1).
 - **$\theta_{\text{rest}}$ (convolutional backbone)**: Trainable with base learning rate.
 - **$\phi$ (critic)**: Trained with a separate Adam optimizer ($\eta_{\text{critic}} = 3 \times 10^{-4}$).
+
+### 4.1 Why $\eta_0 = 3 \times 10^{-6}$ (not $10^{-4}$)
+Each $\rho_{t,k}$ is a Gaussian likelihood ratio over the whole action chunk ($16 \times 7 = 112$ dims) at $\sigma = 0.1$, so $\log \rho \approx (a - \mu)\cdot\Delta\mu / \sigma^2$ reacts strongly to small changes in $\mu$. Adam also moves every one of the 65M UNet weights by roughly $\eta$ per step, whatever the gradient size. We measured the clip fraction over 10 epochs on the same real rollouts (48 episodes, ~14 minibatches/epoch):
+
+| $\eta_0$ | $\varepsilon$ | clip fraction, epoch 1 → 10 | approx. KL per step, epoch 10 |
+|---|---|---|---|
+| $10^{-4}$ | 0.01 | 0.67 → 1.00 (≈0.99 after one step) | — |
+| $10^{-5}$ | 0.05 | 0.53 → 0.90 | 0.019 |
+| $3\times10^{-6}$ | 0.05 | 0.22 → 0.73 | 0.003 |
+| **$3\times10^{-6}$** | **0.1** | **0.07 → 0.54** | **0.007** |
+| $10^{-6}$ | 0.05 | 0.05 → 0.42 | 0.001 |
+
+At $10^{-4}$ a single optimizer step pushes almost every sample outside the clip range. Clipped samples have zero actor gradient, so PPO ignores the data and only the KL term moves the policy. $3\times10^{-6}$ with $\varepsilon = 0.1$ is the largest setting we tried that keeps the clip fraction in the usual PPO range for most of an iteration. As a safety net, `target_kl: 0.005` stops an iteration's epochs early once the mean approximate KL to the rollout policy exceeds 0.005 (≈ epoch 6 at these settings). These values come from the first iteration, so watch `ClipFrac` / `ApproxKL` in the logs: lower $\eta_0$ if `ClipFrac` stays above ~0.5, raise it if it stays near 0.
 
 ---
 
@@ -89,7 +110,22 @@ test/
 
 ---
 
-## 6. How to Run
+## 6. Training Setup
+
+| Setting | Value | Note |
+|---|---|---|
+| Rollouts / iteration | 50 (40% nominal, 30% approach, 30% pre-grasp) | `rollout.n_episodes` |
+| Parallel envs | 16 | denoising batched across envs: 251 ms/chunk vs ~980 ms with 1 env |
+| Horizon | 400 env steps (50 chunks) | successes finish by ~110 steps |
+| Epochs / minibatch | ≤10 (early stop on `target_kl`) / 512 | ~3.2 GB GPU for updates (fits 8 GB) |
+| Discount | γ = 0.99 **per chunk** (8 env steps) | ≈ 0.9987 per env step |
+| Evaluation | 30 episodes × 5 regimes every 10 iters, fixed `eval_seed` | same scenarios for every checkpoint; pretrained baseline at iter 0; best checkpoint gets a 100/regime final eval |
+
+Expected wall-clock is ~8–10 h for 100 iterations. `dppo_last.pt` is written every iteration and `--resume` continues a killed run (see the README for the `nohup` command).
+
+---
+
+## 7. How to Run
 
 ### 1. Run Test Suite
 ```bash
@@ -102,8 +138,14 @@ PYTHONPATH=. uv run python -m src.train_dppo --config config/train_dppo.yaml
 ```
 
 ### 3. Launch Evaluation Benchmark on a Checkpoint
+`--eval-episodes` is per regime. Run without `--checkpoint` to evaluate the pretrained baseline on the same scenarios.
 ```bash
-PYTHONPATH=. uv run python -m src.train_dppo --eval-only --checkpoint results/dppo_checkpoints/dppo_best_iter_10.pt --eval-episodes 20
+PYTHONPATH=. uv run python -m src.train_dppo --eval-only --checkpoint results/dppo_checkpoints/dppo_best_iter_10.pt --eval-episodes 100
+```
+
+### 3b. Resume an Interrupted Run
+```bash
+PYTHONPATH=. uv run python -m src.train_dppo --resume results/dppo_checkpoints/dppo_last.pt
 ```
 
 ### 4. Fast Smoke Run

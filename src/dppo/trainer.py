@@ -10,6 +10,8 @@ and benchmarks recovery generalization on training and held-out disturbance dist
 from __future__ import annotations
 
 import copy
+import json
+import random
 import logging
 import os
 from pathlib import Path
@@ -36,6 +38,29 @@ from src.dppo.buffer import DPPORolloutBuffer
 logger = logging.getLogger(__name__)
 
 
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _get_rng_state() -> Dict[str, Any]:
+    state = {"py": random.getstate(), "np": np.random.get_state(), "torch": torch.get_rng_state()}
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _set_rng_state(state: Dict[str, Any]) -> None:
+    random.setstate(state["py"])
+    np.random.set_state(state["np"])
+    torch.set_rng_state(state["torch"])
+    if "cuda" in state:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
 class DPPOTrainer:
     """
     Trainer executing Recovery-Aware DPPO Fine-Tuning.
@@ -58,6 +83,12 @@ class DPPOTrainer:
 
         logger.info(f"Initializing DPPO Trainer on device: {self.device}")
 
+        # Global seeding (robosuite's placement sampler uses the global np.random)
+        seed = self.config.get("experiment", {}).get("seed", None)
+        if seed is not None:
+            _seed_everything(int(seed))
+            logger.info(f"Seeded RNGs with experiment.seed={seed}")
+
         # Load pretrained model and environment
         self._load_pretrained_model()
         self._setup_critic()
@@ -74,6 +105,8 @@ class DPPOTrainer:
         self.cv = float(rl_cfg.get("critic_weight_cv", 0.5))
         self.epochs = int(rl_cfg.get("epochs", 5))
         self.batch_size = int(rl_cfg.get("batch_size", 128))
+        tk = rl_cfg.get("target_kl", None)
+        self.target_kl = float(tk) if tk is not None else None
 
         self.buffer = DPPORolloutBuffer(
             gamma=self.gamma,
@@ -96,21 +129,45 @@ class DPPOTrainer:
         self.algo = self.policy.policy
         self.algo.set_eval()
 
-        # Build training environment
-        self.env, _ = FileUtils.env_from_checkpoint(
-            ckpt_dict=self.ckpt_dict,
-            render=False,
-            verbose=False,
-        )
+        # Build N independent training environments. Rollouts batch the denoising
+        # chain across envs (one UNet call per denoising step for all envs), which
+        # is the dominant cost: 100 steps take ~0.9 s at batch 1 and ~1.2 s at batch 16.
+        self.num_envs = max(1, int(self.config.get("rollout", {}).get("num_envs", 1)))
+        self.envs = []
+        for _ in range(self.num_envs):
+            env, _ = FileUtils.env_from_checkpoint(
+                ckpt_dict=self.ckpt_dict,
+                render=False,
+                verbose=False,
+            )
+            self.envs.append(env)
+        self.env = self.envs[0]
+        logger.info(f"Created {self.num_envs} rollout environment(s)")
+
+        # Pick θ_0. robomimic runs inference (and computed the checkpoint's success
+        # rate) with the EMA weights, which differ from the raw `nets` by ~7% for the
+        # epoch-150 checkpoint. Fine-tune and anchor to the policy that was evaluated.
+        use_ema = bool(self.config.get("weights", {}).get("use_ema", True))
+        if use_ema and getattr(self.algo, "ema", None) is not None:
+            source_nets = self.algo.ema.averaged_model
+            logger.info("Using EMA weights of the pretrained checkpoint as θ_0")
+        else:
+            if use_ema:
+                logger.warning("weights.use_ema=true but checkpoint has no EMA weights; using raw nets")
+            source_nets = self.algo.nets
+            logger.info("Using raw (non-EMA) weights of the pretrained checkpoint as θ_0")
 
         # Clone and freeze reference policy θ_ref = θ_0
-        self.ref_noise_pred_net = copy.deepcopy(self.algo.nets["policy"]["noise_pred_net"]).to(self.device)
+        self.ref_noise_pred_net = copy.deepcopy(source_nets["policy"]["noise_pred_net"]).to(self.device)
         self.ref_noise_pred_net.eval()
         for p in self.ref_noise_pred_net.parameters():
             p.requires_grad = False
 
-        self.noise_pred_net = self.algo.nets["policy"]["noise_pred_net"]
-        self.obs_encoder = self.algo.nets["policy"]["obs_encoder"]
+        self.noise_pred_net = source_nets["policy"]["noise_pred_net"].to(self.device)
+        # diffusers' EMAModel sets requires_grad=False on the averaged copy; re-enable it
+        # on the trainable net (θ_time is re-frozen in the parameter partition step).
+        self.noise_pred_net.requires_grad_(True)
+        self.obs_encoder = source_nets["policy"]["obs_encoder"].to(self.device)
         self.noise_scheduler = self.algo.noise_scheduler
 
     def _setup_critic(self) -> None:
@@ -124,14 +181,23 @@ class DPPOTrainer:
         k_ft_mode = rollout_cfg.get("k_ft_mode", "all")
         k_ft_stride = int(rollout_cfg.get("k_ft_stride", 1))
 
-        all_timesteps = list(range(self.algo.algo_config.ddpm.num_train_timesteps))
+        # t=0 is the deterministic final step (a^0 = μ) and is never fine-tuned.
+        all_timesteps = list(range(1, self.algo.algo_config.ddpm.num_train_timesteps))
         if k_ft_mode == "strided":
             self.k_ft_set = set(all_timesteps[::k_ft_stride])
         elif k_ft_mode == "tail":
-            tail_m = int(rollout_cfg.get("k_ft_tail_m", 25))
+            tail_m = int(rollout_cfg.get("k_ft_tail_m", 10))
             self.k_ft_set = set(all_timesteps[:tail_m])
-        else:
+        elif k_ft_mode == "all":
             self.k_ft_set = set(all_timesteps)
+        else:
+            raise ValueError(f"Unknown rollout.k_ft_mode '{k_ft_mode}' (expected all/strided/tail)")
+        logger.info(f"Fine-tuned denoising steps K_ft ({k_ft_mode}): {sorted(self.k_ft_set)}")
+
+        self.min_sampling_std = float(rollout_cfg.get("min_sampling_std", 0.1))
+        self.min_logprob_std = float(rollout_cfg.get("min_logprob_std", 0.1))
+        if self.min_logprob_std < self.min_sampling_std:
+            raise ValueError("rollout.min_logprob_std must be >= rollout.min_sampling_std")
 
         self.sampler = DDPMSampler(
             noise_scheduler=self.noise_scheduler,
@@ -144,6 +210,8 @@ class DPPOTrainer:
             action_horizon=self.algo.algo_config.horizon.action_horizon,
             observation_horizon=self.algo.algo_config.horizon.observation_horizon,
             action_dim=self.algo.ac_dim,
+            min_sampling_std=self.min_sampling_std,
+            min_logprob_std=self.min_logprob_std,
         )
 
     def _setup_disturbances(self) -> None:
@@ -151,11 +219,9 @@ class DPPOTrainer:
         dist_cfg = self.config.get("disturbances", {})
         rollout_cfg = self.config.get("rollout", {})
 
-        cfg = DisturbanceConfig(
-            nominal_fraction=float(rollout_cfg.get("nominal_fraction", 0.4)),
-            disturbed_fraction=float(rollout_cfg.get("disturbed_fraction", 0.6)),
-            phase_ratio=tuple(rollout_cfg.get("phase_ratio", (0.5, 0.5))),
-        )
+        cfg = DisturbanceConfig.from_config(rollout_cfg=rollout_cfg, dist_cfg=dist_cfg)
+        for name in ("train_approach", "train_pre_grasp", "ho_approach", "ho_pre_grasp"):
+            logger.info(f"Disturbance spec {name}: {getattr(cfg, name)}")
         self.dist_manager = DisturbanceManager(cfg)
 
     def _setup_parameter_partition_and_optimizers(self) -> None:
@@ -212,140 +278,204 @@ class DPPOTrainer:
                 if group.get("name") == "cond":
                     group["lr"] = decayed_lr
 
+    def _get_current_stacked_obs(self, env: Optional[Any] = None) -> Dict[str, Any]:
+        """
+        Return the current observation in the same format env.step() returns.
+
+        The env is wrapped in a FrameStackWrapper (frame_stack=To), whose
+        `get_observation()` falls through to the inner env and returns a single
+        unstacked frame. inject_disturbance() already rewrote obs_history with
+        the post-disturbance frame, so rebuild the stacked obs from it.
+        """
+        env = self.env if env is None else env
+        if getattr(env, "obs_history", None) is not None:
+            return env._get_stacked_obs_from_history()
+        return env.get_observation()
+
+    @staticmethod
+    def _seeded_reset(env: Any, seed: int) -> Dict[str, Any]:
+        """env.reset() with robosuite's placement sampler (global np.random) seeded, without
+        disturbing the caller's global RNG stream."""
+        state = np.random.get_state()
+        np.random.seed(seed)
+        try:
+            return env.reset()
+        finally:
+            np.random.set_state(state)
+
+    def load_finetuned_weights(self, path: Union[str, Path]) -> Dict[str, Any]:
+        """
+        Load a DPPO checkpoint produced by save_checkpoint() into the trainable
+        policy (and critic). The frozen KL anchor θ_0 is left untouched.
+        """
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        self.noise_pred_net.load_state_dict(ckpt["policy_state_dict"])
+        if "critic_state_dict" in ckpt:
+            self.critic.load_state_dict(ckpt["critic_state_dict"])
+        self.noise_pred_net.eval()
+        logger.info(f"Loaded DPPO fine-tuned weights from {path} (iteration {ckpt.get('iteration')})")
+        return ckpt
+
     def collect_rollouts(
         self,
         n_episodes: int,
         mode: str = "train",
+        min_sampling_std: Optional[float] = None,
+        episode_plan: Optional[List[Optional[Dict[str, Any]]]] = None,
     ) -> Dict[str, Any]:
         """
         Collect on-policy rollout episodes using stratified disturbance sampling (Algorithm 1 lines 4-8).
+
+        Episodes from the plan are spread over self.num_envs environments. Each
+        decision round, the observations of all running envs are denoised in one
+        batched reverse chain; then every env executes its own Ta-step chunk. An env
+        that finishes its episode immediately starts the next unassigned one.
+
+        min_sampling_std: None uses the training exploration floor; 0.0 runs the
+        true DDPM chain (used for evaluation).
+        episode_plan: explicit plan (overrides n_episodes/mode stratification).
         """
         self.buffer.clear()
-        episode_plan = self.dist_manager.plan_iteration_episodes(n_episodes=n_episodes, mode=mode)
-
-        nominal_successes = 0
-        nominal_count = 0
-        approach_successes = 0
-        approach_count = 0
-        pre_grasp_successes = 0
-        pre_grasp_count = 0
-        grasp_times: List[int] = []
+        if episode_plan is None:
+            episode_plan = self.dist_manager.plan_iteration_episodes(n_episodes=n_episodes, mode=mode)
 
         max_horizon = int(self.config.get("rollout", {}).get("horizon", 400))
         Ta = self.algo.algo_config.horizon.action_horizon
+        self.policy.start_episode()
 
-        for ep_idx, dist_spec in enumerate(episode_plan):
-            is_disturbed = dist_spec is not None
-            phase_type = dist_spec["phase"] if is_disturbed else "nominal"
-            self.dist_manager.reset_episode(dist_spec)
+        # One reset seed per planned episode, drawn up front from the global RNG.
+        # With several envs, the order in which episodes start depends on which env
+        # finishes first; seeding each reset ties episode j's initial object pose to
+        # j (not to timing), so fixed-seed evals stay paired across checkpoints.
+        reset_seeds = np.random.randint(0, 2**31 - 1, size=len(episode_plan))
 
-            self.policy.start_episode()
-            obs = self.env.reset()
-            sim_step = 0
-            ep_success = False
+        # Per-env slot state
+        managers = [DisturbanceManager(self.dist_manager.cfg) for _ in self.envs]
+        slots: List[Optional[Dict[str, Any]]] = [None] * len(self.envs)
+        finished: List[Dict[str, Any]] = []  # (plan index, success, grasp step)
+        next_ep = 0
 
-            self.buffer.start_episode(is_disturbed=is_disturbed, phase=phase_type)
+        def start_slot(i: int) -> None:
+            nonlocal next_ep
+            if next_ep >= len(episode_plan):
+                slots[i] = None
+                return
+            spec = episode_plan[next_ep]
+            managers[i].reset_episode(spec)
+            phase_type = spec["phase"] if spec is not None else "nominal"
+            slots[i] = {
+                "plan_idx": next_ep,
+                "phase_type": phase_type,
+                "obs": self._seeded_reset(self.envs[i], int(reset_seeds[next_ep])),
+                "sim_step": 0,
+                "success": False,
+                "grasp_step": None,
+                "episode": self.buffer.new_episode(is_disturbed=spec is not None, phase=phase_type),
+            }
+            next_ep += 1
 
-            while sim_step < max_horizon:
-                # Prepare observation
-                ob_tensor = self.policy._prepare_observation(obs)
-                obs_cond = self.sampler.encode_observation(ob_tensor)
+        for i in range(len(self.envs)):
+            start_slot(i)
 
-                # Query critic value V_ϕ(s_t)
-                with torch.no_grad():
-                    val = float(self.critic(obs_cond).cpu().item())
+        while any(sl is not None for sl in slots):
+            active = [i for i, sl in enumerate(slots) if sl is not None]
 
-                # Generate action chunk and record denoising transitions
-                with torch.no_grad():
-                    executed_actions, _, denoising_transitions = self.sampler.sample_action_chunk_with_trajectory(
-                        obs_dict=ob_tensor,
-                        noise_pred_net=self.noise_pred_net,
-                        k_ft_set=self.k_ft_set,
-                    )
+            # Batched observation encoding, value estimate and reverse chain
+            ob_tensors = [self.policy._prepare_observation(slots[i]["obs"]) for i in active]
+            ob_batch = {k: torch.cat([ob[k] for ob in ob_tensors], dim=0) for k in ob_tensors[0]}
+            with torch.no_grad():
+                obs_cond = self.sampler.encode_observation(ob_batch)
+                values = self.critic(obs_cond).view(-1).cpu().numpy()
+                executed_actions, _, transitions = self.sampler.sample_action_chunk_with_trajectory(
+                    obs_dict=ob_batch,
+                    noise_pred_net=self.noise_pred_net,
+                    k_ft_set=self.k_ft_set,
+                    min_sampling_std=min_sampling_std,
+                )
+            chunk_actions = executed_actions.detach().cpu().numpy()  # (B, Ta, Da)
 
-                chunk_actions = executed_actions.detach().squeeze(0).cpu().numpy()  # shape (Ta, Da)
-                chunk_reward = 0.0
-                chunk_done = False
+            for b, i in enumerate(active):
+                sl, env, mgr = slots[i], self.envs[i], managers[i]
+                chunk_reward, chunk_done = 0.0, False
+                obs = sl["obs"]
 
                 for sub_i in range(Ta):
-                    act = chunk_actions[sub_i]
-                    next_obs, r, d, info = self.env.step(act)
-                    sim_step += 1
+                    act = chunk_actions[b, sub_i]
+                    next_obs, r, d, _ = env.step(act)
+                    sl["sim_step"] += 1
 
-                    # Detect phase
-                    curr_phase = self.dist_manager.detect_phase(act, r, step_i=sim_step)
+                    mgr.detect_phase(act, r, step_i=sl["sim_step"])
+                    if mgr.should_perturb():
+                        record = mgr.inject_disturbance(env, action=act)
+                        if record is not None:
+                            next_obs = self._get_current_stacked_obs(env)
 
-                    # Inject disturbance if criteria match
-                    if self.dist_manager.should_perturb():
-                        self.dist_manager.inject_disturbance(self.env, action=act)
-                        next_obs = self.env.get_observation() if hasattr(self.env, "get_observation") else next_obs
-
-                    # Check success
                     is_succ = False
-                    if hasattr(self.env, "is_success"):
-                        res = self.env.is_success()
+                    if hasattr(env, "is_success"):
+                        res = env.is_success()
                         is_succ = bool(res.get("task", False)) if isinstance(res, dict) else bool(res)
                     elif r >= 1.0:
                         is_succ = True
 
-                    if is_succ:
-                        chunk_reward = 1.0
-                        chunk_done = True
-                        ep_success = True
-                        grasp_times.append(sim_step)
-                        obs = next_obs
-                        break
-
                     obs = next_obs
+                    if is_succ:
+                        chunk_reward, chunk_done = 1.0, True
+                        sl["success"], sl["grasp_step"] = True, sl["sim_step"]
+                        break
                     if d:
                         chunk_done = True
                         break
+                    if sl["sim_step"] >= max_horizon:
+                        break
 
-                # Add chunk step to buffer
-                self.buffer.add_step(
-                    obs_cond=obs_cond.squeeze(0),
+                sl["obs"] = obs
+                self.buffer.add_step_to(
+                    sl["episode"],
+                    obs_cond=obs_cond[b],
                     reward=chunk_reward,
-                    value=val,
+                    value=float(values[b]),
                     done=chunk_done,
-                    denoising_transitions=denoising_transitions,
+                    denoising_transitions=[
+                        {
+                            "timestep": tr["timestep"],
+                            "sample": tr["sample"][b:b + 1],
+                            "prev_sample": tr["prev_sample"][b:b + 1],
+                            "mu": tr["mu"][b:b + 1],
+                            "sigma": tr["sigma"][b:b + 1],
+                        }
+                        for tr in transitions
+                    ],
                 )
 
-                if chunk_done:
-                    break
+                if chunk_done or sl["sim_step"] >= max_horizon:
+                    # Bootstrap V(s_T) only when truncated by the horizon
+                    final_val = 0.0
+                    if not chunk_done:
+                        with torch.no_grad():
+                            s_final = self.sampler.encode_observation(self.policy._prepare_observation(obs))
+                            final_val = float(self.critic(s_final).view(-1)[0].cpu().item())
+                    self.buffer.finish_episode_obj(sl["episode"], success=sl["success"], final_value=final_val)
+                    finished.append({
+                        "plan_idx": sl["plan_idx"],
+                        "phase_type": sl["phase_type"],
+                        "success": sl["success"],
+                        "grasp_step": sl["grasp_step"],
+                    })
+                    start_slot(i)
 
-            # Bootstrap if truncated
-            final_val = 0.0
-            if not ep_success and sim_step >= max_horizon:
-                with torch.no_grad():
-                    ob_tensor = self.policy._prepare_observation(obs)
-                    s_final = self.sampler.encode_observation(ob_tensor)
-                    final_val = float(self.critic(s_final).cpu().item())
+        # Aggregate metrics
+        def rate(phase: str) -> float:
+            eps = [f for f in finished if f["phase_type"] == phase]
+            return (sum(f["success"] for f in eps) / len(eps) * 100.0) if eps else 0.0
 
-            self.buffer.finish_episode(success=ep_success, final_value=final_val)
-
-            # Accumulate metrics
-            if not is_disturbed:
-                nominal_count += 1
-                if ep_success:
-                    nominal_successes += 1
-            else:
-                if phase_type == PHASE_APPROACHING:
-                    approach_count += 1
-                    if ep_success:
-                        approach_successes += 1
-                elif phase_type == PHASE_PRE_GRASP:
-                    pre_grasp_count += 1
-                    if ep_success:
-                        pre_grasp_successes += 1
-
-        stats = {
-            "nominal_success_rate": (nominal_successes / nominal_count * 100.0) if nominal_count > 0 else 0.0,
-            "approach_success_rate": (approach_successes / approach_count * 100.0) if approach_count > 0 else 0.0,
-            "pre_grasp_success_rate": (pre_grasp_successes / pre_grasp_count * 100.0) if pre_grasp_count > 0 else 0.0,
+        finished.sort(key=lambda f: f["plan_idx"])
+        return {
+            "nominal_success_rate": rate("nominal"),
+            "approach_success_rate": rate(PHASE_APPROACHING),
+            "pre_grasp_success_rate": rate(PHASE_PRE_GRASP),
             "total_episodes": len(episode_plan),
-            "grasp_times": grasp_times,
+            "grasp_times": [f["grasp_step"] for f in finished if f["success"]],
         }
-        return stats
 
     def update_policy_and_critic(self) -> Dict[str, float]:
         """
@@ -391,9 +521,12 @@ class DPPOTrainer:
         kl_losses = []
         clip_fractions = []
 
+        approx_kls = []
+        epochs_run = 0
         self.noise_pred_net.train()
 
-        for _ in range(self.epochs):
+        for epoch in range(self.epochs):
+            epoch_kls = []
             for cond, sample, prev_sample, mu_old, sigma, t_step, adv in actor_loader:
                 self.actor_optimizer.zero_grad()
 
@@ -444,6 +577,18 @@ class DPPOTrainer:
                 actor_losses.append(act_loss.item())
                 kl_losses.append(kl_loss.item())
                 clip_fractions.append(act_metrics["clip_fraction"])
+                epoch_kls.append(act_metrics["approx_kl"])
+
+            epochs_run = epoch + 1
+            approx_kls.extend(epoch_kls)
+            # PPO early stopping: the policy has drifted far enough from the rollout
+            # policy that further epochs would mostly hit the clip.
+            if self.target_kl is not None and float(np.mean(epoch_kls)) > self.target_kl:
+                logger.info(
+                    f"Early stop after epoch {epochs_run}/{self.epochs}: "
+                    f"approx_kl {np.mean(epoch_kls):.4f} > target_kl {self.target_kl}"
+                )
+                break
 
         self.noise_pred_net.eval()
 
@@ -452,61 +597,164 @@ class DPPOTrainer:
             "kl_loss": float(np.mean(kl_losses)) if kl_losses else 0.0,
             "critic_loss": float(np.mean(critic_losses)) if critic_losses else 0.0,
             "clip_fraction": float(np.mean(clip_fractions)) if clip_fractions else 0.0,
+            "approx_kl": float(np.mean(approx_kls)) if approx_kls else 0.0,
+            "epochs_run": float(epochs_run),
         }
 
-    def evaluate(self, n_episodes: int = 20) -> Dict[str, float]:
+    def evaluate(self, n_per_regime: Optional[int] = None) -> Dict[str, float]:
         """
-        Evaluate current policy on:
-        1. Nominal task (ξ = ∅)
-        2. Training disturbances (Ξ_train)
-        3. Held-out disturbances (Ξ_ho)
+        Evaluate current policy on 5 regimes with the SAME number of episodes each:
+        nominal, train-approach, train-pre-grasp, held-out-approach, held-out-pre-grasp.
+
+        Uses a fixed rl.eval_seed so every call sees identical initial object poses
+        and disturbance draws (paired comparison across checkpoints), then restores
+        the training RNG state so training randomness is unaffected.
         """
-        logger.info(f"Running evaluation ({n_episodes} rollouts per regime)...")
+        rl_cfg = self.config.get("rl", {})
+        n = int(n_per_regime if n_per_regime is not None else rl_cfg.get("eval_episodes_per_regime", 30))
+        eval_seed = rl_cfg.get("eval_seed", 1234)
+        logger.info(f"Running evaluation ({n} rollouts per regime, 5 regimes, eval_seed={eval_seed})...")
         self.noise_pred_net.eval()
 
-        # Evaluate on training distribution
-        train_stats = self.collect_rollouts(n_episodes=n_episodes, mode="train")
-        # Evaluate on held-out distribution
-        ho_stats = self.collect_rollouts(n_episodes=n_episodes, mode="held_out")
+        saved_rng = _get_rng_state()
+        if eval_seed is not None:
+            _seed_everything(int(eval_seed))
+        try:
+            train_plan = self.dist_manager.plan_episodes(n, n, n, mode="train")
+            ho_plan = self.dist_manager.plan_episodes(0, n, n, mode="held_out")
+            # Evaluate with the true DDPM chain (no exploration σ floor), matching how
+            # the pretrained baseline is evaluated.
+            train_stats = self.collect_rollouts(0, mode="train", min_sampling_std=0.0, episode_plan=train_plan)
+            ho_stats = self.collect_rollouts(0, mode="held_out", min_sampling_std=0.0, episode_plan=ho_plan)
+        finally:
+            _set_rng_state(saved_rng)
+            self.buffer.clear()
 
-        eval_summary = {
+        return {
             "eval_nominal_success": train_stats["nominal_success_rate"],
             "eval_train_approach_success": train_stats["approach_success_rate"],
             "eval_train_pre_grasp_success": train_stats["pre_grasp_success_rate"],
             "eval_ho_approach_success": ho_stats["approach_success_rate"],
             "eval_ho_pre_grasp_success": ho_stats["pre_grasp_success_rate"],
+            "eval_episodes_per_regime": float(n),
         }
-        return eval_summary
 
-    def save_checkpoint(self, path: Union[str, Path], iteration: int, metrics: Dict[str, float]) -> str:
-        """Export fine-tuned policy checkpoint."""
+    @staticmethod
+    def _selection_score(m: Dict[str, float]) -> float:
+        """Pareto score prioritizing both nominal and held-out disturbed recovery."""
+        return (
+            0.4 * m["eval_nominal_success"]
+            + 0.3 * m["eval_ho_approach_success"]
+            + 0.3 * m["eval_ho_pre_grasp_success"]
+        )
+
+    def _log_eval(self, tag: str, m: Dict[str, float]) -> None:
+        logger.info(
+            f"{tag}: Nominal={m['eval_nominal_success']:.1f}%, "
+            f"TrainApp={m['eval_train_approach_success']:.1f}%, "
+            f"TrainPre={m['eval_train_pre_grasp_success']:.1f}%, "
+            f"HO App={m['eval_ho_approach_success']:.1f}%, "
+            f"HO Pre={m['eval_ho_pre_grasp_success']:.1f}% "
+            f"(n={int(m['eval_episodes_per_regime'])}/regime, score={self._selection_score(m):.2f})"
+        )
+
+    def save_checkpoint(
+        self,
+        path: Union[str, Path],
+        iteration: int,
+        metrics: Dict[str, Any],
+        training_state: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        Export fine-tuned policy checkpoint. If training_state is given, optimizer
+        and RNG state are included so the run can be resumed (see resume_state()).
+        Written to a temp file and renamed, so a kill mid-save never leaves a
+        truncated checkpoint.
+        """
         save_path = Path(path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
 
         ckpt = {
             "iteration": iteration,
+            "base_checkpoint": str(self.checkpoint_path),
             "policy_state_dict": self.noise_pred_net.state_dict(),
             "critic_state_dict": self.critic.state_dict(),
             "metrics": metrics,
         }
-        torch.save(ckpt, save_path)
+        if training_state is not None:
+            ckpt["training_state"] = {
+                **training_state,
+                "actor_optimizer": self.actor_optimizer.state_dict(),
+                "critic_optimizer": self.critic_optimizer.state_dict(),
+                "rng": _get_rng_state(),
+            }
+        tmp_path = save_path.with_suffix(save_path.suffix + ".tmp")
+        torch.save(ckpt, tmp_path)
+        os.replace(tmp_path, save_path)
         logger.info(f"Saved DPPO checkpoint to {save_path}")
         return str(save_path)
 
-    def train(self, total_iterations: int = 100, episodes_per_iter: int = 20) -> Dict[str, Any]:
+    def resume_state(self, path: Union[str, Path]) -> Dict[str, Any]:
+        """Restore weights, optimizers and RNG from a checkpoint saved with training_state."""
+        ckpt = self.load_finetuned_weights(path)
+        state = ckpt.get("training_state")
+        if state is None:
+            raise ValueError(f"{path} has no training_state; resume from dppo_last.pt")
+        self.actor_optimizer.load_state_dict(state["actor_optimizer"])
+        self.critic_optimizer.load_state_dict(state["critic_optimizer"])
+        rng = state["rng"]
+        if "cuda" in rng:
+            rng["cuda"] = [t.cpu() for t in rng["cuda"]]
+        rng["torch"] = rng["torch"].cpu()
+        _set_rng_state(rng)
+        logger.info(f"Resumed training state from {path} at iteration {ckpt['iteration']}")
+        return {**state, "iteration": int(ckpt["iteration"])}
+
+    def train(
+        self,
+        total_iterations: int = 100,
+        episodes_per_iter: int = 20,
+        resume_from: Optional[Union[str, Path]] = None,
+    ) -> Dict[str, Any]:
         """
         Run the complete DPPO training loop (Algorithm 1).
+
+        Every iteration overwrites save_dir/dppo_last.pt (with optimizer + RNG state)
+        and appends a line to save_dir/metrics.jsonl, so a killed run can continue
+        with resume_from=save_dir/dppo_last.pt.
         """
         logger.info(f"Starting DPPO Training for {total_iterations} iterations, {episodes_per_iter} episodes/iter.")
 
+        rl_cfg = self.config.get("rl", {})
+        eval_interval = int(rl_cfg.get("eval_interval", 10))
+        final_eval_n = int(rl_cfg.get("final_eval_episodes_per_regime", 0))
+        metrics_path = self.save_dir / "metrics.jsonl"
+
         best_score = -1.0
         best_ckpt = ""
-        history = []
+        history: List[Dict[str, Any]] = []
+        baseline_metrics: Dict[str, float] = {}
+        start_iteration = 1
 
-        eval_interval = int(self.config.get("rl", {}).get("eval_interval", 10))
-        eval_episodes = int(self.config.get("rl", {}).get("eval_episodes", 20))
+        if resume_from is not None:
+            state = self.resume_state(resume_from)
+            start_iteration = state["iteration"] + 1
+            best_score = float(state.get("best_score", -1.0))
+            best_ckpt = state.get("best_ckpt", "")
+            baseline_metrics = state.get("baseline_metrics", {})
+            # LR schedule is a pure function of the iteration
+            self._decay_actor_lr(state["iteration"])
+            logger.info(f"Resuming at iteration {start_iteration} (best_score={best_score:.2f}, best={best_ckpt or 'none'})")
+        elif rl_cfg.get("eval_at_start", True):
+            # Baseline: pretrained policy on the exact same eval scenarios. A fine-tuned
+            # checkpoint is only saved as "best" if it beats this.
+            baseline_metrics = self.evaluate()
+            self._log_eval("Baseline (pretrained, iter 0)", baseline_metrics)
+            best_score = self._selection_score(baseline_metrics)
+            with open(metrics_path, "a") as f:
+                f.write(json.dumps({"iteration": 0, **baseline_metrics}) + "\n")
 
-        for iteration in range(1, total_iterations + 1):
+        for iteration in range(start_iteration, total_iterations + 1):
             logger.info(f"\n--- Iteration {iteration} / {total_iterations} ---")
 
             # 1. Collect rollouts
@@ -523,7 +771,9 @@ class DPPOTrainer:
                 f"Update: ActorLoss={update_metrics.get('actor_loss', 0.0):.4f}, "
                 f"CriticLoss={update_metrics.get('critic_loss', 0.0):.4f}, "
                 f"KLLoss={update_metrics.get('kl_loss', 0.0):.4f}, "
-                f"ClipFrac={update_metrics.get('clip_fraction', 0.0):.3f}"
+                f"ClipFrac={update_metrics.get('clip_fraction', 0.0):.3f}, "
+                f"ApproxKL={update_metrics.get('approx_kl', 0.0):.4f}, "
+                f"Epochs={int(update_metrics.get('epochs_run', 0))}"
             )
 
             # 3. Parameter schedule step
@@ -532,20 +782,11 @@ class DPPOTrainer:
             # 4. Periodic evaluation
             iter_summary = {**rollout_stats, **update_metrics, "iteration": iteration}
             if iteration % eval_interval == 0 or iteration == total_iterations:
-                eval_metrics = self.evaluate(n_episodes=eval_episodes)
-                logger.info(
-                    f"Evaluation: Nominal={eval_metrics['eval_nominal_success']:.1f}%, "
-                    f"HO Approach={eval_metrics['eval_ho_approach_success']:.1f}%, "
-                    f"HO PreGrasp={eval_metrics['eval_ho_pre_grasp_success']:.1f}%"
-                )
+                eval_metrics = self.evaluate()
+                self._log_eval(f"Evaluation (iter {iteration})", eval_metrics)
                 iter_summary.update(eval_metrics)
 
-                # Pareto score prioritizing both nominal and held-out disturbed recovery
-                score = (
-                    0.4 * eval_metrics["eval_nominal_success"]
-                    + 0.3 * eval_metrics["eval_ho_approach_success"]
-                    + 0.3 * eval_metrics["eval_ho_pre_grasp_success"]
-                )
+                score = self._selection_score(eval_metrics)
                 if score > best_score:
                     best_score = score
                     best_ckpt = self.save_checkpoint(
@@ -555,12 +796,35 @@ class DPPOTrainer:
                     )
 
             history.append(iter_summary)
+            with open(metrics_path, "a") as f:
+                f.write(json.dumps({k: v for k, v in iter_summary.items() if k != "grasp_times"}) + "\n")
 
-        # Save last checkpoint
-        self.save_checkpoint(self.save_dir / "dppo_last.pt", iteration=total_iterations, metrics=history[-1])
+            # Resumable snapshot every iteration (overwritten)
+            self.save_checkpoint(
+                self.save_dir / "dppo_last.pt",
+                iteration=iteration,
+                metrics=iter_summary,
+                training_state={
+                    "best_score": best_score,
+                    "best_ckpt": best_ckpt,
+                    "baseline_metrics": baseline_metrics,
+                },
+            )
+
+        # Final, larger evaluation of the selected checkpoint (the periodic evals are
+        # only for model selection; report these numbers instead).
+        final_metrics: Dict[str, float] = {}
+        if best_ckpt and final_eval_n > 0:
+            self.load_finetuned_weights(best_ckpt)
+            final_metrics = self.evaluate(n_per_regime=final_eval_n)
+            self._log_eval(f"Final eval of {Path(best_ckpt).name}", final_metrics)
+        elif not best_ckpt:
+            logger.warning("No fine-tuned checkpoint beat the pretrained baseline score.")
 
         return {
             "best_checkpoint": best_ckpt,
             "best_score": best_score,
+            "baseline_metrics": baseline_metrics,
+            "final_metrics": final_metrics,
             "history": history,
         }

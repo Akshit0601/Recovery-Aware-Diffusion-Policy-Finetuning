@@ -68,11 +68,15 @@ def compute_actor_loss(
     with torch.no_grad():
         clip_fraction = torch.mean((torch.abs(ratio - 1.0) > clip_eps).float()).item()
         mean_ratio = torch.mean(ratio).item()
+        # Low-variance estimator of KL(π_old || π_θ) per denoising step (Schulman's k3)
+        lr_flat = log_ratio.squeeze(-1)
+        approx_kl = torch.mean((ratio - 1.0) - lr_flat).item()
 
     metrics = {
         "actor_loss": actor_loss.item(),
         "mean_ratio": mean_ratio,
         "clip_fraction": clip_fraction,
+        "approx_kl": approx_kl,
     }
     return actor_loss, metrics
 

@@ -46,6 +46,70 @@ class DisturbanceConfig:
         default_factory=lambda: PhaseDisturbanceSpec((-0.05, 0.05), (-0.03, 0.03), (-35.0, 35.0), 5)
     )
 
+    # YAML (split, phase) -> dataclass field
+    _SPEC_FIELDS = {
+        ("train", "approach"): "train_approach",
+        ("train", "pre_grasp"): "train_pre_grasp",
+        ("held_out", "approach"): "ho_approach",
+        ("held_out", "pre_grasp"): "ho_pre_grasp",
+    }
+
+    @classmethod
+    def from_config(
+        cls,
+        rollout_cfg: Optional[Dict[str, Any]] = None,
+        dist_cfg: Optional[Dict[str, Any]] = None,
+    ) -> "DisturbanceConfig":
+        """
+        Build from the `rollout:` and `disturbances:` YAML sections.
+
+        Any key present in YAML overrides the dataclass default; missing keys keep
+        the default. Unknown splits/phases/keys raise so typos don't get silently
+        ignored.
+        """
+        rollout_cfg = rollout_cfg or {}
+        dist_cfg = dist_cfg or {}
+        cfg = cls()
+
+        if "nominal_fraction" in rollout_cfg:
+            cfg.nominal_fraction = float(rollout_cfg["nominal_fraction"])
+        if "disturbed_fraction" in rollout_cfg:
+            cfg.disturbed_fraction = float(rollout_cfg["disturbed_fraction"])
+        if "phase_ratio" in rollout_cfg:
+            pr = rollout_cfg["phase_ratio"]
+            if len(pr) != 2:
+                raise ValueError(f"rollout.phase_ratio must have 2 entries, got {pr}")
+            cfg.phase_ratio = (float(pr[0]), float(pr[1]))
+        if abs(cfg.nominal_fraction + cfg.disturbed_fraction - 1.0) > 1e-6:
+            raise ValueError(
+                f"nominal_fraction ({cfg.nominal_fraction}) + disturbed_fraction "
+                f"({cfg.disturbed_fraction}) must sum to 1"
+            )
+
+        valid_keys = {"x_range", "y_range", "yaw_range_deg", "delay_steps"}
+        for split, phases in dist_cfg.items():
+            if split not in ("train", "held_out"):
+                raise ValueError(f"Unknown disturbances split '{split}' (expected train/held_out)")
+            for phase, overrides in (phases or {}).items():
+                key = (split, phase)
+                if key not in cls._SPEC_FIELDS:
+                    raise ValueError(f"Unknown disturbances phase '{split}.{phase}' (expected approach/pre_grasp)")
+                unknown = set(overrides or {}) - valid_keys
+                if unknown:
+                    raise ValueError(f"Unknown keys in disturbances.{split}.{phase}: {sorted(unknown)}")
+
+                attr = cls._SPEC_FIELDS[key]
+                spec: PhaseDisturbanceSpec = getattr(cfg, attr)
+                for range_key in ("x_range", "y_range", "yaw_range_deg"):
+                    if range_key in overrides:
+                        lo, hi = (float(v) for v in overrides[range_key])
+                        if lo > hi:
+                            raise ValueError(f"disturbances.{split}.{phase}.{range_key}: low > high ({lo}, {hi})")
+                        setattr(spec, range_key, (lo, hi))
+                if "delay_steps" in overrides:
+                    spec.delay_steps = int(overrides["delay_steps"])
+        return cfg
+
 
 class DisturbanceManager:
     """
@@ -67,7 +131,7 @@ class DisturbanceManager:
         mode: str = "train",
     ) -> List[Optional[Dict[str, Any]]]:
         """
-        Create stratified assignment of episodes for an iteration.
+        Create stratified assignment of episodes for a training iteration.
 
         Args:
             n_episodes: Total number of episodes N_ep
@@ -83,44 +147,38 @@ class DisturbanceManager:
         total_p = p_app + p_pre
         n_approach = int(round(n_disturbed * (p_app / total_p)))
         n_pre_grasp = n_disturbed - n_approach
+        return self.plan_episodes(n_nominal, n_approach, n_pre_grasp, mode=mode)
 
-        episode_plan: List[Optional[Dict[str, Any]]] = []
+    def plan_episodes(
+        self,
+        n_nominal: int,
+        n_approach: int,
+        n_pre_grasp: int,
+        mode: str = "train",
+    ) -> List[Optional[Dict[str, Any]]]:
+        """
+        Build a shuffled episode plan with explicit counts per regime
+        (used directly by evaluation so every regime gets the same sample size).
+        """
+        if mode not in ("train", "held_out"):
+            raise ValueError(f"Unknown disturbance mode '{mode}'")
 
-        # Nominal episodes
-        for _ in range(n_nominal):
-            episode_plan.append(None)
+        episode_plan: List[Optional[Dict[str, Any]]] = [None] * n_nominal
 
-        # Approach disturbed episodes
-        for _ in range(n_approach):
-            spec = self.cfg.train_approach if mode == "train" else self.cfg.ho_approach
-            dx = float(np.random.uniform(*spec.x_range))
-            dy = float(np.random.uniform(*spec.y_range))
-            dyaw = float(np.random.uniform(*spec.yaw_range_deg))
-            episode_plan.append({
-                "phase": PHASE_APPROACHING,
-                "delta_x": dx,
-                "delta_y": dy,
-                "delta_z": 0.0,
-                "delta_yaw_deg": dyaw,
-                "delay_steps": spec.delay_steps,
-                "mode": mode,
-            })
-
-        # Pre-grasp disturbed episodes
-        for _ in range(n_pre_grasp):
-            spec = self.cfg.train_pre_grasp if mode == "train" else self.cfg.ho_pre_grasp
-            dx = float(np.random.uniform(*spec.x_range))
-            dy = float(np.random.uniform(*spec.y_range))
-            dyaw = float(np.random.uniform(*spec.yaw_range_deg))
-            episode_plan.append({
-                "phase": PHASE_PRE_GRASP,
-                "delta_x": dx,
-                "delta_y": dy,
-                "delta_z": 0.0,
-                "delta_yaw_deg": dyaw,
-                "delay_steps": spec.delay_steps,
-                "mode": mode,
-            })
+        for phase, n, spec in (
+            (PHASE_APPROACHING, n_approach, self.cfg.train_approach if mode == "train" else self.cfg.ho_approach),
+            (PHASE_PRE_GRASP, n_pre_grasp, self.cfg.train_pre_grasp if mode == "train" else self.cfg.ho_pre_grasp),
+        ):
+            for _ in range(n):
+                episode_plan.append({
+                    "phase": phase,
+                    "delta_x": float(np.random.uniform(*spec.x_range)),
+                    "delta_y": float(np.random.uniform(*spec.y_range)),
+                    "delta_z": 0.0,
+                    "delta_yaw_deg": float(np.random.uniform(*spec.yaw_range_deg)),
+                    "delay_steps": spec.delay_steps,
+                    "mode": mode,
+                })
 
         # Shuffle plan for randomized execution order
         indices = np.random.permutation(len(episode_plan))

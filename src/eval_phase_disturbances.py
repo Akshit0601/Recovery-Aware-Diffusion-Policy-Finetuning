@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 # Target phase(s) during which the object pose disturbance will be injected.
 # Options: "approaching", "pre-grasp", "grasped", or a list like ["approaching", "pre-grasp"]
-PERTURB_PHASE: Union[str, List[str]] = "pre-grasp"
+PERTURB_PHASE: Union[str, List[str]] = "approaching"
 
 # Pose Disturbance Displacements (applied to object in simulation):
 DELTA_X: float = 0.03          # Linear displacement along X in meters (+2.5 cm)
@@ -48,7 +48,7 @@ DELTA_YAW_DEG: float = 50.0     # Yaw rotation displacement in degrees (+15°)
 
 # Trigger timing within the phase:
 PERTURB_ONCE_PER_EPISODE: bool = True   # Apply disturbance only once per rollout episode
-PERTURB_STEP_DELAY: int = 0         # Number of steps after entering phase before perturbing (0 = immediately)
+PERTURB_STEP_DELAY: int = 20       # Number of steps after entering phase before perturbing (0 = immediately)
 
 # Random Disturbance Mode (Optional override):
 # If True, uniform random values within the ranges below are sampled instead of fixed DELTA_*

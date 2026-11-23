@@ -54,19 +54,27 @@ class DPPORolloutBuffer:
         self.current_episode["disturbed"] = is_disturbed
         self.current_episode["phase"] = phase
 
-    def add_step(
+    def new_episode(self, is_disturbed: bool = False, phase: str = "nominal") -> Dict[str, Any]:
+        """Create a detached episode record (several can be in flight with parallel envs)."""
+        ep = self._create_empty_episode()
+        ep["disturbed"] = is_disturbed
+        ep["phase"] = phase
+        return ep
+
+    def add_step_to(
         self,
+        episode: Dict[str, Any],
         obs_cond: torch.Tensor,
         reward: float,
         value: float,
         done: bool,
         denoising_transitions: List[Dict[str, Any]],
     ) -> None:
-        """Add a single environment chunk step and its reverse denoising chain."""
-        self.current_episode["obs_conds"].append(obs_cond.detach().cpu())
-        self.current_episode["rewards"].append(float(reward))
-        self.current_episode["values"].append(float(value))
-        self.current_episode["dones"].append(bool(done))
+        """Add a single environment chunk step and its reverse denoising chain to `episode`."""
+        episode["obs_conds"].append(obs_cond.detach().cpu())
+        episode["rewards"].append(float(reward))
+        episode["values"].append(float(value))
+        episode["dones"].append(bool(done))
 
         # Store denoising transitions for this chunk decision step
         step_transitions = []
@@ -78,13 +86,29 @@ class DPPORolloutBuffer:
                 "mu": tr["mu"].detach().cpu(),
                 "sigma": tr["sigma"].detach().cpu(),
             })
-        self.current_episode["denoising_steps"].append(step_transitions)
+        episode["denoising_steps"].append(step_transitions)
+
+    def finish_episode_obj(self, episode: Dict[str, Any], success: bool, final_value: float = 0.0) -> None:
+        """Mark `episode` complete with its bootstrap value and store it."""
+        episode["success"] = bool(success)
+        episode["final_value"] = float(final_value)
+        self.episodes.append(episode)
+
+    # Single-episode convenience API (used by tests / sequential callers)
+    def add_step(
+        self,
+        obs_cond: torch.Tensor,
+        reward: float,
+        value: float,
+        done: bool,
+        denoising_transitions: List[Dict[str, Any]],
+    ) -> None:
+        """Add a single environment chunk step and its reverse denoising chain."""
+        self.add_step_to(self.current_episode, obs_cond, reward, value, done, denoising_transitions)
 
     def finish_episode(self, success: bool, final_value: float = 0.0) -> None:
         """Mark end of episode, store final bootstrap value, and save to buffer."""
-        self.current_episode["success"] = bool(success)
-        self.current_episode["final_value"] = float(final_value)
-        self.episodes.append(self.current_episode)
+        self.finish_episode_obj(self.current_episode, success, final_value)
         self.current_episode = self._create_empty_episode()
 
     def compute_gae_and_flatten(self) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, float]]:

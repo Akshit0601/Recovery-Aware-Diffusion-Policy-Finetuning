@@ -17,3 +17,8 @@ robomimic/diffusion_policy_trained_models/
 robomimic/datasets/
 history/
 *.ipynb
+# DPPO fine-tuning outputs (checkpoints are ~260 MB each)
+logs/
+results/dppo_checkpoints/
+results/test_dppo_checkpoints/
+*.pt
