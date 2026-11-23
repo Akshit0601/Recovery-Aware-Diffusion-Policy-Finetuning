@@ -24,15 +24,20 @@ from src.diffusion_policy_runner import DiffusionPolicyRunner
 # ==============================================================================
 # Evaluation Parameters (Edit directly here)
 # ==============================================================================
-X_MIN = -0.03              # Minimum X coordinate in meters
-X_MAX = 0.03               # Maximum X coordinate in meters
-Y_MIN = -0.03               # Minimum Y coordinate in meters
-Y_MAX = 0.03                # Maximum Y coordinate in meters
+X_MIN = -0.1              # Minimum X coordinate in meters
+X_MAX = 0.1               # Maximum X coordinate in meters
+Y_MIN = -0.1               # Minimum Y coordinate in meters
+Y_MAX = 0.1                # Maximum Y coordinate in meters
 RESOLUTION = 25             # Grid resolution N along each axis (N x N spatial positions)
 YAW: Union[float, List[float]] = [0.0, 45.0]  # Yaw angle(s) in degrees: e.g. 0.0 or [0.0, 30.0, 45.0]
-OUTPUT_DIR = "results_full/heatmaps"  # Directory to save heatmaps and JSON statistics
+OUTPUT_DIR = "results_full/heatmaps_dppo"  # Directory to save heatmaps and JSON statistics
 
 DEFAULT_CHECKPOINT_PATH = (
+   "/home/akshit/ece285_proj/ckpt/dppo_best_iter_100.pt"
+)
+# Base robomimic checkpoint used when DEFAULT_CHECKPOINT_PATH is a DPPO checkpoint
+# (DPPO .pt files hold only the fine-tuned UNet weights, not the full policy).
+BASE_CHECKPOINT_PATH = (
     "/home/akshit/ece285_proj/robomimic/diffusion_policy_trained_models/"
     "test/20261024164824/models/model_epoch_150_low_dim_v15_success_1.0.pth"
 )
@@ -123,6 +128,33 @@ class WorkspaceHeatmapEvaluator(DiffusionPolicyRunner):
         self.results_by_yaw: Dict[float, np.ndarray] = {}
         self.contact_by_yaw: Dict[float, np.ndarray] = {}
         self.detailed_records: List[Dict[str, Any]] = []
+
+    def load_policy(self, force: bool = False):
+        """Load a robomimic checkpoint, or a DPPO checkpoint on top of its base checkpoint."""
+        import torch
+
+        if self.policy is not None and not force:
+            return self.policy, self.ckpt_dict or {}
+        ckpt_path = self.weights_cfg.get("checkpoint_path")
+        loaded = torch.load(os.path.expanduser(str(ckpt_path)), map_location="cpu", weights_only=False)
+        if not (isinstance(loaded, dict) and "policy_state_dict" in loaded):
+            return super().load_policy(force=force)
+
+        stored_base = loaded.get("base_checkpoint")
+        base = stored_base if stored_base and os.path.exists(stored_base) else BASE_CHECKPOINT_PATH
+        print(f"DPPO checkpoint (iteration {loaded.get('iteration')}); base robomimic checkpoint: {base}")
+        self.weights_cfg["checkpoint_path"] = base
+        try:
+            policy, ckpt_dict = super().load_policy(force=True)
+        finally:
+            self.weights_cfg["checkpoint_path"] = ckpt_path
+        # robomimic runs inference with the EMA nets when present; the DPPO weights
+        # were fine-tuned from (and replace) that EMA noise-prediction UNet.
+        algo = policy.policy
+        nets = algo.ema.averaged_model if getattr(algo, "ema", None) is not None else algo.nets
+        nets["policy"]["noise_pred_net"].load_state_dict(loaded["policy_state_dict"])
+        algo.nets["policy"]["noise_pred_net"].load_state_dict(loaded["policy_state_dict"])
+        return policy, ckpt_dict
 
     def set_target_pose(self, x: float, y: float, yaw_deg: float) -> None:
         """Set the target object pose for subsequent rollouts."""

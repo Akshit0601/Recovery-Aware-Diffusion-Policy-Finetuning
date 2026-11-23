@@ -38,6 +38,50 @@ pip install -r requirements.txt
 ```
 Afterwards, every `uv run python ...` command in this README is just `python ...` with the environment activated.
 
+### Server Setup (conda)
+All commands are run from the repo root. Install packages with pip, not conda, so the pinned versions in
+`requirements.txt` (including `torch==2.6.0+cu124`) are what you get. The server needs `git` and internet access,
+because robosuite is installed from a GitHub commit.
+
+1. **Create the env and install dependencies** (Python 3.10 is required):
+   ```bash
+   conda create -n dp-env python=3.10 -y
+   conda activate dp-env
+   pip install -r requirements.txt
+   ```
+   If `dp-env` already exists, just activate it and run `pip install -r requirements.txt`. pip skips packages that
+   already match a pin, changes any that are on a different version, and leaves extra packages alone. To preview the
+   changes first:
+   `pip install -r requirements.txt --dry-run 2>&1 | grep "Would install"`.
+
+2. **Reinstall robomimic in compat mode.** The repo root contains a plain `robomimic/` folder. With the default
+   editable install, running from the repo root (or with `PYTHONPATH=.`) makes Python import that folder as an empty
+   namespace package instead of the real `robomimic/robomimic/`:
+   ```bash
+   pip install -e ./robomimic --no-deps --config-settings editable_mode=compat
+   ```
+
+3. **Verify:**
+   ```bash
+   python -c "import robomimic; print(robomimic.__file__)"
+   # expected: <repo>/robomimic/robomimic/__init__.py
+   python -c "from robomimic.config.base_config import REGISTERED_CONFIGS; print(list(REGISTERED_CONFIGS))"
+   # expected: list includes 'diffusion_policy'
+   pip check
+   ```
+
+4. **Copy the pretrained checkpoint.** It is gitignored; see the rsync command in
+   [section 5](#5-dppo-recovery-fine-tuning-server--headless).
+
+**Troubleshooting**
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `Config for algo name diffusion_policy not found` | PyPI `robomimic` (in `site-packages`) is installed instead of the repo copy | `pip uninstall -y robomimic` (repeat until "not installed"), then step 2 |
+| `robomimic.__file__` prints `None` | The repo-root `robomimic/` folder shadows the installed package | Step 2 (compat mode) |
+| `pip show robomimic` has no `Editable project location` | robomimic was not installed from the repo | Step 2 |
+| `Weights only load failed ... numpy.core.multiarray.scalar` | PyTorch >= 2.6 defaults to `torch.load(weights_only=True)` | Already handled in `src/dppo/trainer.py` and `src/diffusion_policy_runner.py`; pull the latest code |
+
 ---
 
 ## Configuration & Usage
