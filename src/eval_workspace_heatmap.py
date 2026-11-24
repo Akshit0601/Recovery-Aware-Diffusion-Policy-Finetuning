@@ -542,17 +542,29 @@ class WorkspaceHeatmapEvaluator(DiffusionPolicyRunner):
 
 
 def main():
+    import argparse
+
+    global BASE_CHECKPOINT_PATH
+    parser = argparse.ArgumentParser(description="Workspace grasp failure heatmap evaluator")
+    parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT_PATH,
+                        help="robomimic .pth or DPPO .pt checkpoint to evaluate")
+    parser.add_argument("--base-checkpoint", default=BASE_CHECKPOINT_PATH,
+                        help="base robomimic .pth for a DPPO checkpoint (used if the path stored in it is missing)")
+    parser.add_argument("--output-dir", default=OUTPUT_DIR)
+    args = parser.parse_args()
+    BASE_CHECKPOINT_PATH = args.base_checkpoint
+
     yaws = [float(YAW)] if isinstance(YAW, (int, float)) else [float(y) for y in YAW]
 
     evaluator = WorkspaceHeatmapEvaluator(
-        checkpoint_path=DEFAULT_CHECKPOINT_PATH,
+        checkpoint_path=args.checkpoint,
         x_range=(X_MIN, X_MAX),
         y_range=(Y_MIN, Y_MAX),
         yaw_degrees=yaws,
         resolution=RESOLUTION,
         trials_per_pose=1,
         horizon=200,
-        output_dir=OUTPUT_DIR,
+        output_dir=args.output_dir,
     )
 
     evaluator.evaluate_all()
