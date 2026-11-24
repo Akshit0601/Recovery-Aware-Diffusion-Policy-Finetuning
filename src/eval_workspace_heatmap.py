@@ -5,6 +5,10 @@ Workspace Grasp & Task Failure Heatmap Evaluator (Config-Free).
 Evaluates trained Diffusion Policy across a 2D spatial grid of object spawn poses
 and multiple yaw orientations (e.g. 0°, 30°, 45°) directly using DiffusionPolicyRunner's
 lifecycle hooks and override methods, without requiring any external YAML config file.
+
+All parameters are defined directly at the top of this file (no argparse required).
+Run with:
+    PYTHONPATH=. python -m src.eval_workspace_heatmap
 """
 
 from __future__ import annotations
@@ -15,35 +19,50 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import matplotlib
+
+matplotlib.use("Agg")  # headless servers / worker processes
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 from tqdm import tqdm
 
+from src.checkpoint_utils import DEFAULT_BASE_CHECKPOINT, CheckpointLoaderMixin
 from src.diffusion_policy_runner import DiffusionPolicyRunner
 
 # ==============================================================================
-# Evaluation Parameters (Edit directly here)
+# Evaluation Parameters (Edit directly here - No Argparse)
 # ==============================================================================
-X_MIN = -0.1              # Minimum X coordinate in meters
-X_MAX = 0.1               # Maximum X coordinate in meters
-Y_MIN = -0.1               # Minimum Y coordinate in meters
-Y_MAX = 0.1                # Maximum Y coordinate in meters
-RESOLUTION = 25             # Grid resolution N along each axis (N x N spatial positions)
-YAW: Union[float, List[float]] = [0.0, 45.0]  # Yaw angle(s) in degrees: e.g. 0.0 or [0.0, 30.0, 45.0]
-OUTPUT_DIR = "results_full/heatmaps_dppo"  # Directory to save heatmaps and JSON statistics
-
-DEFAULT_CHECKPOINT_PATH = (
-   "/home/akshit/ece285_proj/ckpt/dppo_best_iter_100.pt"
-)
-# Base robomimic checkpoint used when DEFAULT_CHECKPOINT_PATH is a DPPO checkpoint
+# Checkpoint to evaluate: robomimic .pth (e.g. the epoch-150 baseline) or DPPO .pt.
+# Relative paths resolve against the repo root.
+CHECKPOINT_PATH: str = "ckpt/dppo_best_iter_100.pt"
+# Pretrained robomimic .pth whose noise-prediction UNet a DPPO .pt overrides
 # (DPPO .pt files hold only the fine-tuned UNet weights, not the full policy).
-BASE_CHECKPOINT_PATH = (
-    "/home/akshit/ece285_proj/robomimic/diffusion_policy_trained_models/"
-    "test/20261024164824/models/model_epoch_150_low_dim_v15_success_1.0.pth"
-)
+BASE_CHECKPOINT_PATH: str = DEFAULT_BASE_CHECKPOINT
+
+# Workspace grid:
+X_MIN: float = -0.1             # Minimum X coordinate in meters
+X_MAX: float = 0.1              # Maximum X coordinate in meters
+Y_MIN: float = -0.1             # Minimum Y coordinate in meters
+Y_MAX: float = 0.1              # Maximum Y coordinate in meters
+RESOLUTION: int = 25            # Grid resolution N along each axis (N x N spatial positions)
+YAW: Union[float, List[float]] = [0.0, 45.0]  # Yaw angle(s) in degrees: e.g. 0.0 or [0.0, 30.0, 45.0]
+
+# Rollout settings:
+TRIALS_PER_POSE: int = 1        # Rollouts evaluated at each (X, Y, Yaw) pose
+HORIZON: int = 200              # Maximum simulation steps per rollout
+SEED: Optional[int] = 0         # Per-pose seeding: every checkpoint sees the same policy noise at
+                                # each (pose, trial), so heatmaps are comparable. None disables.
+CPU: bool = False               # Force CPU execution
+VERBOSE: bool = False
+
+# Output:
+OUTPUT_DIR: str = "results_full/heatmaps_dppo"  # Directory to save heatmaps and JSON statistics
+
+DEFAULT_CHECKPOINT_PATH = CHECKPOINT_PATH
 
 
-class WorkspaceHeatmapEvaluator(DiffusionPolicyRunner):
+class WorkspaceHeatmapEvaluator(CheckpointLoaderMixin, DiffusionPolicyRunner):
     """
     Evaluator that sweeps object poses (X, Y, Yaw) across the robot workspace
     by overriding DiffusionPolicyRunner's reset and placement lifecycle hooks.
@@ -61,12 +80,14 @@ class WorkspaceHeatmapEvaluator(DiffusionPolicyRunner):
         output_dir: str = "results/heatmaps",
         cpu: bool = False,
         verbose: bool = False,
+        base_checkpoint: Optional[str] = BASE_CHECKPOINT_PATH,
+        seed: Optional[int] = SEED,
     ) -> None:
         """
         Initialize the evaluator purely in Python without requiring a YAML file.
 
         Args:
-            checkpoint_path: Path to trained .pth model checkpoint.
+            checkpoint_path: robomimic .pth or DPPO .pt checkpoint to evaluate.
             x_range: (min_x, max_x) workspace interval in meters.
             y_range: (min_y, max_y) workspace interval in meters.
             yaw_degrees: List of yaw rotation angles in degrees (e.g. [0, 30, 45]).
@@ -76,6 +97,10 @@ class WorkspaceHeatmapEvaluator(DiffusionPolicyRunner):
             output_dir: Output folder for heatmaps and JSON statistics.
             cpu: Whether to force CPU execution.
             verbose: Enable verbose logging.
+            base_checkpoint: Pretrained robomimic .pth whose UNet is overridden when
+                checkpoint_path is a DPPO .pt (ignored for a robomimic .pth).
+            seed: Per-pose seeding base: every checkpoint sees the same policy-noise stream
+                at each (pose, trial), so heatmaps are directly comparable. None disables.
         """
         # Construct configuration purely in-memory (bypassing external YAML file)
         in_memory_config = {
@@ -85,7 +110,7 @@ class WorkspaceHeatmapEvaluator(DiffusionPolicyRunner):
             "rollout": {
                 "n_rollouts": 1,
                 "horizon": horizon,
-                "seed": 0,
+                "seed": 0 if seed is None else int(seed),
             },
             "env": {
                 "env_name": None,
@@ -118,6 +143,8 @@ class WorkspaceHeatmapEvaluator(DiffusionPolicyRunner):
         self.trials_per_pose = int(trials_per_pose)
         self.horizon = int(horizon)
         self.output_dir = output_dir
+        self.base_checkpoint = base_checkpoint
+        self.seed = seed
 
         # Current target pose state for hook overrides
         self.current_x: float = 0.0
@@ -128,33 +155,6 @@ class WorkspaceHeatmapEvaluator(DiffusionPolicyRunner):
         self.results_by_yaw: Dict[float, np.ndarray] = {}
         self.contact_by_yaw: Dict[float, np.ndarray] = {}
         self.detailed_records: List[Dict[str, Any]] = []
-
-    def load_policy(self, force: bool = False):
-        """Load a robomimic checkpoint, or a DPPO checkpoint on top of its base checkpoint."""
-        import torch
-
-        if self.policy is not None and not force:
-            return self.policy, self.ckpt_dict or {}
-        ckpt_path = self.weights_cfg.get("checkpoint_path")
-        loaded = torch.load(os.path.expanduser(str(ckpt_path)), map_location="cpu", weights_only=False)
-        if not (isinstance(loaded, dict) and "policy_state_dict" in loaded):
-            return super().load_policy(force=force)
-
-        stored_base = loaded.get("base_checkpoint")
-        base = stored_base if stored_base and os.path.exists(stored_base) else BASE_CHECKPOINT_PATH
-        print(f"DPPO checkpoint (iteration {loaded.get('iteration')}); base robomimic checkpoint: {base}")
-        self.weights_cfg["checkpoint_path"] = base
-        try:
-            policy, ckpt_dict = super().load_policy(force=True)
-        finally:
-            self.weights_cfg["checkpoint_path"] = ckpt_path
-        # robomimic runs inference with the EMA nets when present; the DPPO weights
-        # were fine-tuned from (and replace) that EMA noise-prediction UNet.
-        algo = policy.policy
-        nets = algo.ema.averaged_model if getattr(algo, "ema", None) is not None else algo.nets
-        nets["policy"]["noise_pred_net"].load_state_dict(loaded["policy_state_dict"])
-        algo.nets["policy"]["noise_pred_net"].load_state_dict(loaded["policy_state_dict"])
-        return policy, ckpt_dict
 
     def set_target_pose(self, x: float, y: float, yaw_deg: float) -> None:
         """Set the target object pose for subsequent rollouts."""
@@ -188,7 +188,7 @@ class WorkspaceHeatmapEvaluator(DiffusionPolicyRunner):
         return super().reset_env(env=active_env, policy=policy)
 
     def evaluate_single_pose(
-        self, x: float, y: float, yaw_deg: float
+        self, x: float, y: float, yaw_deg: float, pose_idx: int = 0
     ) -> Dict[str, Any]:
         """
         Evaluate policy rollouts at a specific (X, Y, Yaw) pose.
@@ -210,6 +210,10 @@ class WorkspaceHeatmapEvaluator(DiffusionPolicyRunner):
         )
 
         for trial_i in range(self.trials_per_pose):
+            if self.seed is not None:
+                s = int(self.seed) * 100_003 + pose_idx * self.trials_per_pose + trial_i
+                np.random.seed(s % (2**32))
+                torch.manual_seed(s)
             stats, _ = self.rollout_episode(
                 episode_idx=trial_i,
                 horizon=self.horizon,
@@ -287,6 +291,7 @@ class WorkspaceHeatmapEvaluator(DiffusionPolicyRunner):
 
         total_pbar = tqdm(total=total_evaluations, desc="Evaluating (X, Y, Yaw) Poses")
 
+        pose_idx = 0
         for yaw in self.yaw_degrees:
             fail_mat = np.zeros((self.resolution, self.resolution), dtype=float)
             cont_mat = np.zeros((self.resolution, self.resolution), dtype=float)
@@ -296,7 +301,8 @@ class WorkspaceHeatmapEvaluator(DiffusionPolicyRunner):
                 for j, x in enumerate(xs):
                     col_idx = j
 
-                    record = self.evaluate_single_pose(x=x, y=y, yaw_deg=yaw)
+                    record = self.evaluate_single_pose(x=x, y=y, yaw_deg=yaw, pose_idx=pose_idx)
+                    pose_idx += 1
                     record["grid_row"] = row_idx
                     record["grid_col"] = col_idx
 
@@ -523,6 +529,8 @@ class WorkspaceHeatmapEvaluator(DiffusionPolicyRunner):
         data = {
             "metadata": {
                 "checkpoint": self.weights_cfg.get("checkpoint_path"),
+                "checkpoint_info": self.checkpoint_info,
+                "seed": self.seed,
                 "x_range": list(self.x_range),
                 "y_range": list(self.y_range),
                 "yaw_degrees": self.yaw_degrees,
@@ -542,29 +550,22 @@ class WorkspaceHeatmapEvaluator(DiffusionPolicyRunner):
 
 
 def main():
-    import argparse
-
-    global BASE_CHECKPOINT_PATH
-    parser = argparse.ArgumentParser(description="Workspace grasp failure heatmap evaluator")
-    parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT_PATH,
-                        help="robomimic .pth or DPPO .pt checkpoint to evaluate")
-    parser.add_argument("--base-checkpoint", default=BASE_CHECKPOINT_PATH,
-                        help="base robomimic .pth for a DPPO checkpoint (used if the path stored in it is missing)")
-    parser.add_argument("--output-dir", default=OUTPUT_DIR)
-    args = parser.parse_args()
-    BASE_CHECKPOINT_PATH = args.base_checkpoint
-
+    """Run the workspace heatmap evaluation with the parameters defined at the top of this file."""
     yaws = [float(YAW)] if isinstance(YAW, (int, float)) else [float(y) for y in YAW]
 
     evaluator = WorkspaceHeatmapEvaluator(
-        checkpoint_path=args.checkpoint,
+        checkpoint_path=CHECKPOINT_PATH,
         x_range=(X_MIN, X_MAX),
         y_range=(Y_MIN, Y_MAX),
         yaw_degrees=yaws,
         resolution=RESOLUTION,
-        trials_per_pose=1,
-        horizon=200,
-        output_dir=args.output_dir,
+        trials_per_pose=TRIALS_PER_POSE,
+        horizon=HORIZON,
+        output_dir=OUTPUT_DIR,
+        cpu=CPU,
+        verbose=VERBOSE,
+        base_checkpoint=BASE_CHECKPOINT_PATH,
+        seed=SEED,
     )
 
     evaluator.evaluate_all()

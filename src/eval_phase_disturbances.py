@@ -23,7 +23,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import torch
 
+from src.checkpoint_utils import DEFAULT_BASE_CHECKPOINT, CheckpointLoaderMixin
 from src.diffusion_policy_runner import (
     ALL_PHASES,
     PHASE_APPROACHING,
@@ -68,15 +70,20 @@ HORIZON: int = 400                      # Maximum steps per episode
 RENDER: bool = True                    # Set True for real-time graphical visualization
 VIDEO_PATH: Optional[str] = None        # e.g. "results/phase_disturbances/video.mp4" (or None)
 OUTPUT_DIR: str = "results/phase_disturbances_approaching"  # Directory to save metrics and disturbance records
-SEED: int = 42
+CPU: bool = False                       # Force CPU execution
+SEED: int = 42                          # Per-episode seeding: episode i has the same initial pose,
+                                        # disturbance and policy noise for every checkpoint
 
-DEFAULT_CHECKPOINT_PATH = (
-    "/home/akshit/ece285_proj/robomimic/diffusion_policy_trained_models/"
-    "test/20261024164824/models/model_epoch_150_low_dim_v15_success_1.0.pth"
-)
+# Checkpoint to evaluate: robomimic .pth (e.g. the epoch-150 baseline) or DPPO .pt.
+# Relative paths resolve against the repo root, e.g. "ckpt/dppo_best_iter_100.pt".
+CHECKPOINT_PATH: str = DEFAULT_BASE_CHECKPOINT
+# Pretrained robomimic .pth whose noise-prediction UNet a DPPO .pt overrides
+# (DPPO .pt files hold only the fine-tuned UNet weights, not the full policy).
+BASE_CHECKPOINT_PATH: str = DEFAULT_BASE_CHECKPOINT
+DEFAULT_CHECKPOINT_PATH = CHECKPOINT_PATH
 
 
-class PhaseDisturbanceRunner(DiffusionPolicyRunner):
+class PhaseDisturbanceRunner(CheckpointLoaderMixin, DiffusionPolicyRunner):
     """
     Evaluator that injects object pose disturbances during specified execution phases.
 
@@ -108,6 +115,7 @@ class PhaseDisturbanceRunner(DiffusionPolicyRunner):
         video_path: Optional[str] = VIDEO_PATH,
         output_dir: str = OUTPUT_DIR,
         seed: int = SEED,
+        base_checkpoint: Optional[str] = BASE_CHECKPOINT_PATH,
         config: Optional[Dict[str, Any]] = None,
         config_path: Optional[Union[str, Path]] = None,
         overrides: Optional[Dict[str, Any]] = None,
@@ -132,12 +140,15 @@ class PhaseDisturbanceRunner(DiffusionPolicyRunner):
         self.init_y = init_y
         self.init_yaw_deg = init_yaw_deg
         self.output_dir = output_dir
+        self.base_checkpoint = base_checkpoint
+        self.seed = seed
 
         # Runtime disturbance tracking state
         self.current_step: int = 0
         self.phase_step_count: int = 0
         self.has_perturbed_in_episode: bool = False
         self.applied_disturbances: List[Dict[str, Any]] = []
+        self._disturbance_rng: Optional[np.random.Generator] = None
 
         if config is None and config_path is None and policy is None and env is None:
             in_memory_config = {
@@ -256,9 +267,10 @@ class PhaseDisturbanceRunner(DiffusionPolicyRunner):
         dyaw = float(delta_yaw_deg if delta_yaw_deg is not None else self.delta_yaw_deg)
 
         if self.use_random:
-            dx = float(np.random.uniform(*self.random_x_range))
-            dy = float(np.random.uniform(*self.random_y_range))
-            dyaw = float(np.random.uniform(*self.random_yaw_range))
+            rng = self._disturbance_rng if self._disturbance_rng is not None else np.random
+            dx = float(rng.uniform(*self.random_x_range))
+            dy = float(rng.uniform(*self.random_y_range))
+            dyaw = float(rng.uniform(*self.random_yaw_range))
 
         orig_pos, orig_quat = self.get_object_pose()
 
@@ -348,6 +360,15 @@ class PhaseDisturbanceRunner(DiffusionPolicyRunner):
     def on_episode_start(self, episode_idx: int) -> None:
         """Reset disturbance tracking state at the beginning of each episode."""
         super().on_episode_start(episode_idx)
+        # Per-episode seeding (runs before reset_env): episode i gets the same initial
+        # object pose, policy noise stream and disturbance draw for every checkpoint,
+        # regardless of how earlier episodes played out. Disturbances come from their
+        # own generator so the draw does not depend on when the phase triggers.
+        if self.seed is not None:
+            ep_seed = int(self.seed) * 100_003 + int(episode_idx)
+            np.random.seed(ep_seed % (2**32))
+            torch.manual_seed(ep_seed)
+            self._disturbance_rng = np.random.default_rng([int(self.seed), int(episode_idx), 7])
         self.current_step = 0
         self.phase_step_count = 0
         self.has_perturbed_in_episode = False
@@ -492,7 +513,11 @@ class PhaseDisturbanceRunner(DiffusionPolicyRunner):
 
 def run_phase_disturbance_eval() -> Dict[str, Any]:
     """Execute phase disturbance evaluation using the parameters defined in headers."""
-    runner = PhaseDisturbanceRunner()
+    runner = PhaseDisturbanceRunner(
+        checkpoint_path=CHECKPOINT_PATH,
+        base_checkpoint=BASE_CHECKPOINT_PATH,
+        overrides={"system": {"cpu": CPU}},
+    )
     results = runner.run(n_rollouts=N_ROLLOUTS)
     runner.save_results(results)
     return results
