@@ -10,10 +10,12 @@ and benchmarks recovery generalization on training and held-out disturbance dist
 from __future__ import annotations
 
 import copy
+import csv
 import json
 import random
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -375,6 +377,7 @@ class DPPOTrainer:
                 "sim_step": 0,
                 "success": False,
                 "grasp_step": None,
+                "disturb_step": None,
                 "episode": self.buffer.new_episode(is_disturbed=spec is not None, phase=phase_type),
             }
             next_ep += 1
@@ -414,6 +417,7 @@ class DPPOTrainer:
                         record = mgr.inject_disturbance(env, action=act)
                         if record is not None:
                             next_obs = self._get_current_stacked_obs(env)
+                            sl["disturb_step"] = sl["sim_step"]
 
                     is_succ = False
                     if hasattr(env, "is_success"):
@@ -465,6 +469,10 @@ class DPPOTrainer:
                         "phase_type": sl["phase_type"],
                         "success": sl["success"],
                         "grasp_step": sl["grasp_step"],
+                        "episode_steps": sl["sim_step"],
+                        "disturb_step": sl["disturb_step"],
+                        "reset_seed": int(reset_seeds[sl["plan_idx"]]),
+                        "spec": episode_plan[sl["plan_idx"]],
                     })
                     start_slot(i)
 
@@ -480,6 +488,7 @@ class DPPOTrainer:
             "pre_grasp_success_rate": rate(PHASE_PRE_GRASP),
             "total_episodes": len(episode_plan),
             "grasp_times": [f["grasp_step"] for f in finished if f["success"]],
+            "episodes": finished,  # per-episode outcomes, sorted by plan index
         }
 
     def update_policy_and_critic(self) -> Dict[str, float]:
@@ -606,7 +615,7 @@ class DPPOTrainer:
             "epochs_run": float(epochs_run),
         }
 
-    def evaluate(self, n_per_regime: Optional[int] = None) -> Dict[str, float]:
+    def evaluate(self, n_per_regime: Optional[int] = None, tag: Optional[str] = None) -> Dict[str, float]:
         """
         Evaluate current policy on 5 regimes with the SAME number of episodes each:
         nominal, train-approach, train-pre-grasp, held-out-approach, held-out-pre-grasp.
@@ -614,6 +623,11 @@ class DPPOTrainer:
         Uses a fixed rl.eval_seed so every call sees identical initial object poses
         and disturbance draws (paired comparison across checkpoints), then restores
         the training RNG state so training randomness is unaffected.
+
+        Per-episode outcomes are written to save_dir/eval_episodes/<tag>.csv (and kept
+        in self.last_eval_episodes). With the same eval_seed and n, the column
+        `episode_key` identifies the same scenario across checkpoints, so two CSVs can
+        be joined on it for a paired (McNemar) comparison.
         """
         rl_cfg = self.config.get("rl", {})
         n = int(n_per_regime if n_per_regime is not None else rl_cfg.get("eval_episodes_per_regime", 30))
@@ -635,6 +649,14 @@ class DPPOTrainer:
             _set_rng_state(saved_rng)
             self.buffer.clear()
 
+        records = self._eval_episode_records(train_stats["episodes"], "train", eval_seed, n)
+        records += self._eval_episode_records(ho_stats["episodes"], "held_out", eval_seed, n)
+        self.last_eval_episodes = records
+        if tag is None:
+            tag = time.strftime("eval_n{}_%Y%m%d_%H%M%S".format(n))
+        out_path = self._write_eval_episodes(records, tag)
+        logger.info(f"Per-episode eval outcomes written to {out_path}")
+
         return {
             "eval_nominal_success": train_stats["nominal_success_rate"],
             "eval_train_approach_success": train_stats["approach_success_rate"],
@@ -643,6 +665,45 @@ class DPPOTrainer:
             "eval_ho_pre_grasp_success": ho_stats["pre_grasp_success_rate"],
             "eval_episodes_per_regime": float(n),
         }
+
+    @staticmethod
+    def _eval_episode_records(
+        episodes: List[Dict[str, Any]], mode: str, eval_seed: Any, n: int
+    ) -> List[Dict[str, Any]]:
+        """Flatten collect_rollouts()['episodes'] into one row per evaluation episode."""
+        prefix = "train" if mode == "train" else "ho"
+        rows = []
+        for ep in episodes:
+            spec = ep.get("spec") or {}
+            phase = str(ep["phase_type"]).replace("-", "_")  # approaching | pre_grasp
+            regime = "nominal" if phase == "nominal" else f"{prefix}_{phase}"
+            rows.append({
+                "episode_key": f"{eval_seed}:{n}:{mode}:{ep['plan_idx']}",
+                "regime": regime,
+                "plan_idx": ep["plan_idx"],
+                "reset_seed": ep["reset_seed"],
+                "success": int(bool(ep["success"])),
+                "grasp_step": ep["grasp_step"] if ep["grasp_step"] is not None else "",
+                "episode_steps": ep["episode_steps"],
+                "disturbance_applied": int(ep["disturb_step"] is not None),
+                "disturb_step": ep["disturb_step"] if ep["disturb_step"] is not None else "",
+                "delta_x": spec.get("delta_x", ""),
+                "delta_y": spec.get("delta_y", ""),
+                "delta_yaw_deg": spec.get("delta_yaw_deg", ""),
+                "delay_steps": spec.get("delay_steps", ""),
+            })
+        return rows
+
+    def _write_eval_episodes(self, records: List[Dict[str, Any]], tag: str) -> Path:
+        out_dir = self.save_dir / "eval_episodes"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{tag}.csv"
+        fields = list(records[0].keys()) if records else ["episode_key"]
+        with open(out_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(records)
+        return out_path
 
     @staticmethod
     def _selection_score(m: Dict[str, float]) -> float:
@@ -753,7 +814,7 @@ class DPPOTrainer:
         elif rl_cfg.get("eval_at_start", True):
             # Baseline: pretrained policy on the exact same eval scenarios. A fine-tuned
             # checkpoint is only saved as "best" if it beats this.
-            baseline_metrics = self.evaluate()
+            baseline_metrics = self.evaluate(tag="iter_000_baseline")
             self._log_eval("Baseline (pretrained, iter 0)", baseline_metrics)
             best_score = self._selection_score(baseline_metrics)
             with open(metrics_path, "a") as f:
@@ -785,9 +846,14 @@ class DPPOTrainer:
             self._decay_actor_lr(iteration)
 
             # 4. Periodic evaluation
-            iter_summary = {**rollout_stats, **update_metrics, "iteration": iteration}
+            # Per-episode rollout details stay out of metrics.jsonl and the checkpoints
+            iter_summary = {
+                **{k: v for k, v in rollout_stats.items() if k != "episodes"},
+                **update_metrics,
+                "iteration": iteration,
+            }
             if iteration % eval_interval == 0 or iteration == total_iterations:
-                eval_metrics = self.evaluate()
+                eval_metrics = self.evaluate(tag=f"iter_{iteration:03d}")
                 self._log_eval(f"Evaluation (iter {iteration})", eval_metrics)
                 iter_summary.update(eval_metrics)
 
@@ -821,7 +887,9 @@ class DPPOTrainer:
         final_metrics: Dict[str, float] = {}
         if best_ckpt and final_eval_n > 0:
             self.load_finetuned_weights(best_ckpt)
-            final_metrics = self.evaluate(n_per_regime=final_eval_n)
+            final_metrics = self.evaluate(
+                n_per_regime=final_eval_n, tag=f"final_{Path(best_ckpt).stem}_n{final_eval_n}"
+            )
             self._log_eval(f"Final eval of {Path(best_ckpt).name}", final_metrics)
         elif not best_ckpt:
             logger.warning("No fine-tuned checkpoint beat the pretrained baseline score.")

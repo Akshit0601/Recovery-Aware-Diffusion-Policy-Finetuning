@@ -125,7 +125,9 @@ def main() -> None:
         if dppo_weights_path is not None:
             trainer.load_finetuned_weights(dppo_weights_path)
         logger.info("Executing evaluation benchmark...")
-        eval_results = trainer.evaluate(n_per_regime=args.eval_episodes)
+        name = Path(dppo_weights_path or ckpt_path).stem if (dppo_weights_path or args.checkpoint) else "pretrained"
+        n_eval = args.eval_episodes or cfg.get("rl", {}).get("eval_episodes_per_regime", 30)
+        eval_results = trainer.evaluate(n_per_regime=args.eval_episodes, tag=f"evalonly_{name}_n{n_eval}")
         print("\n" + "=" * 60)
         print("               DPPO EVALUATION BENCHMARK")
         print("=" * 60)

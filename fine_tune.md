@@ -62,6 +62,25 @@ The true DDPM $\sigma_k$ is tiny near the end of the chain ($\sigma_1 \approx 0.
 ### 3.5 Total Loss
 $$L(\theta, \phi) = L_{\text{actor}}(\theta) + c_v L_{\text{critic}}(\phi) + \beta L_{\text{KL}}(\theta)$$
 
+### 3.6 Approximate KL and `target_kl` Early Stopping
+Implemented in `compute_actor_loss` (`src/dppo/losses.py`) and `update_policy_and_critic` (`src/dppo/trainer.py`).
+
+1. **Per-step log ratio.** For every stored denoising transition $(t, k)$, using the shared $\sigma_k$ floored at `min_logprob_std` $= 0.1$ and summing over the whole $16 \times 7$ action chunk:
+$$\log \rho_{t,k} = \frac{\|a_t^{k-1} - \mu_{\theta_{\text{old}}}\|^2 - \|a_t^{k-1} - \mu_\theta\|^2}{2\sigma_k^2}$$
+It is clamped to $[-20, 20]$ only to avoid `exp` overflow.
+
+2. **Estimate from the unclipped ratio.** Schulman's k3 estimator of $\text{KL}(\pi_{\theta_{\text{old}}} \parallel \pi_\theta)$ over a minibatch $B$:
+$$\widehat{\text{KL}} = \frac{1}{|B|} \sum_{(t,k) \in B} \left[ (\rho_{t,k} - 1) - \log \rho_{t,k} \right] \ge 0$$
+PPO's clip $[1-\varepsilon, 1+\varepsilon]$ is applied only inside $L_{\text{actor}}$ (§3.2). It does not enter this estimate. A clipped sample has zero actor gradient but still adds its full drift to `ApproxKL`, so the KL keeps measuring how far $\pi_\theta$ has moved even when most samples are clipped.
+
+3. **`ClipFrac` is separate:** the fraction of samples with $|\rho_{t,k} - 1| > \varepsilon$. It rises with the KL, but only `ApproxKL` controls early stopping.
+
+4. **Early-stop rule.** Each minibatch's $\widehat{\text{KL}}$ is computed on the forward pass *before* that minibatch's Adam step. After each full epoch the trainer averages that epoch's minibatch values; if the average exceeds `target_kl` ($0.005$), the remaining epochs are skipped (`Early stop after epoch N/10` in the log). The check runs only between epochs, so the epoch that trips it has already gone slightly past $0.005$ by its last minibatches. The critic is not affected and always trains for all `epochs`.
+
+5. **Logged value.** The `ApproxKL` on the `Update:` log line is the mean over *all* epochs of the iteration, including the early ones where it starts near 0. It therefore sits below `target_kl` (≈ 0.003 in the 100-iteration run) even though every iteration stopped on it (at epoch 5–6).
+
+This KL is to the rollout policy $\pi_{\theta_{\text{old}}}$ of the current iteration and resets every iteration. It is different from $L_{\text{KL}}$ (§3.4, `KLLoss` in the log), the closed-form KL to the frozen $\pi_{\theta_0}$, which is a $\beta$-weighted penalty and accumulates over the run (0.003 → 0.27).
+
 ---
 
 ## 4. Parameter Partitioning Schedule

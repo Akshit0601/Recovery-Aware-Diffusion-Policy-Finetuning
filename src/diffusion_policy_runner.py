@@ -796,7 +796,6 @@ class DiffusionPolicyRunner:
 
                 # Step environment
                 next_obs, r, done, info = self.step_env(act, env=active_env)
-                logging.info(f"the obs looks  like {next_obs}")
                 total_reward += float(r)
                 success = self.check_success(
                     obs=next_obs, reward=r, done=done, info=info, env=active_env
@@ -811,7 +810,6 @@ class DiffusionPolicyRunner:
                     info=info,
                     step_i=step_i,
                 )
-                logging.info(f"the current phase for the arm is {new_phase}")
                 if new_phase != current_phase:
                     self.on_phase_transition(
                         prev_phase=current_phase,
